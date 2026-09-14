@@ -1,22 +1,30 @@
 """Object detection on generic x86 CPU (no NPU).
 
-Runs the pre-conversion yolov5s_relu.onnx directly via onnxruntime instead
-of the RKNN path. Labels, anchors, mapping and box-decode/NMS math are
-copied verbatim from the RK3588 variant; only the input layout (NCHW
-float32, explicit /255) and loading glue differ.
+Runs an ONNX model directly via onnxruntime. Two output layouts are supported
+and auto-detected, so either model works:
+
+  * Ultralytics YOLOv5 ONNX export (default: models/yolov5n.onnx) -- a single
+    ``[1, N, 5+num_classes]`` output with box decode (xywh, pixels) and
+    sigmoid already baked into the graph.
+  * Rockchip yolov5s_relu.onnx -- three raw ``[1,255,H,W]`` heads that need the
+    anchor/grid decode (same math as the RK3588 variant).
+
+Override the model with AIPORT_MODEL_PATH. Labels/anchors, the COCO->AI-Port
+type mapping and the box/NMS math are kept identical to the RK3588 variant so
+avclient.py needs no changes.
 """
 import logging
 import os
 import threading
 
 import numpy as np
-import onnxruntime as ort
 
 log = logging.getLogger("aiport-detector-x86")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "yolov5s_relu.onnx")
+DEFAULT_MODEL = os.path.join(MODELS_DIR, "yolov5n.onnx")
+MODEL_PATH = os.environ.get("AIPORT_MODEL_PATH") or DEFAULT_MODEL
 LABELS_PATH = os.path.join(MODELS_DIR, "coco_80_labels_list.txt")
 ANCHORS_PATH = os.path.join(MODELS_DIR, "anchors_yolov5.txt")
 
@@ -52,6 +60,7 @@ def _load_labels():
         return [line.strip() for line in f if line.strip()]
 
 
+# --- Rockchip raw-head layout ([1,255,H,W] x3) -----------------------------
 # _box_process through _post_process are copied verbatim from the RK3588
 # detector.py; keep them unchanged for easy diffing.
 
@@ -115,6 +124,21 @@ def _nms_boxes(boxes, scores):
     return np.array(keep)
 
 
+def _nms_per_class(boxes, classes, scores):
+    nboxes, nclasses, nscores = [], [], []
+    for c in set(classes.tolist()):
+        idx = np.where(classes == c)
+        b, s = boxes[idx], scores[idx]
+        keep = _nms_boxes(b, s)
+        if len(keep):
+            nboxes.append(b[keep])
+            nclasses.append(np.full(len(keep), c))
+            nscores.append(s[keep])
+    if not nboxes:
+        return None, None, None
+    return np.concatenate(nboxes), np.concatenate(nclasses), np.concatenate(nscores)
+
+
 def _post_process(outputs, anchors):
     boxes, scores, classes_conf = [], [], []
     reshaped = [o.reshape([len(anchors[0]), -1] + list(o.shape[-2:])) for o in outputs]
@@ -134,19 +158,31 @@ def _post_process(outputs, anchors):
     boxes, classes, scores = _filter_boxes(boxes, scores, classes_conf)
     if boxes.shape[0] == 0:
         return None, None, None
+    return _nms_per_class(boxes, classes, scores)
 
-    nboxes, nclasses, nscores = [], [], []
-    for c in set(classes):
-        idx = np.where(classes == c)
-        b, s = boxes[idx], scores[idx]
-        keep = _nms_boxes(b, s)
-        if len(keep):
-            nboxes.append(b[keep])
-            nclasses.append(np.full(len(keep), c))
-            nscores.append(s[keep])
-    if not nboxes:
+
+# --- Ultralytics layout ([1,N,5+num_classes], decode baked in) -------------
+
+def _xywh2xyxy(xywh):
+    xyxy = np.copy(xywh)
+    xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
+    xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
+    xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
+    xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
+    return xyxy
+
+
+def _post_process_ultralytics(output):
+    pred = output[0]  # (N, 5+num_classes): xywh(px), obj, class scores
+    obj = pred[:, 4]
+    class_conf = pred[:, 5:]
+    classes = np.argmax(class_conf, axis=1)
+    scores = obj * class_conf[np.arange(class_conf.shape[0]), classes]
+    keep = scores >= OBJ_THRESH
+    if not np.any(keep):
         return None, None, None
-    return np.concatenate(nboxes), np.concatenate(nclasses), np.concatenate(nscores)
+    boxes = _xywh2xyxy(pred[keep, :4])
+    return _nms_per_class(boxes, classes[keep], scores[keep])
 
 
 class Detector:
@@ -157,27 +193,48 @@ class Detector:
     """
 
     def __init__(self):
+        try:
+            import onnxruntime as ort  # imported here so tests don't need it
+        except ImportError as exc:
+            raise RuntimeError(
+                "onnxruntime is not installed -- pip install onnxruntime, or run "
+                "the x86 Docker image (see piport/x86/README.md)") from exc
         self._lock = threading.Lock()
         self._labels = _load_labels()
         self._anchors = _load_anchors()
         # CPU-only by design; use ["CUDAExecutionProvider",
         # "CPUExecutionProvider"] if onnxruntime-gpu is swapped in.
         self._session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-        self._input_name = self._session.get_inputs()[0].name
-        log.info("Detector initialized (%s, providers=%s)",
-                  MODEL_PATH, self._session.get_providers())
+        inp = self._session.get_inputs()[0]
+        self._input_name = inp.name
+        # Ultralytics' release ONNX is float16; honour whatever the graph wants.
+        self._in_dtype = np.float16 if "float16" in inp.type else np.float32
+        outs = self._session.get_outputs()
+        shapes = [o.shape for o in outs]
+        # One [1,N,5+classes] output => Ultralytics (decode baked in);
+        # otherwise the three Rockchip raw heads.
+        if len(outs) == 1 and len(shapes[0]) == 3 and shapes[0][-1] == 5 + len(self._labels):
+            self._mode = "ultralytics"
+        else:
+            self._mode = "raw_heads"
+        log.info("Detector initialized (%s, mode=%s, outputs=%s, providers=%s)",
+                  MODEL_PATH, self._mode, shapes, self._session.get_providers())
 
     def detect(self, frame_rgb):
         """frame_rgb: HxWx3 uint8 RGB, already resized to IMG_SIZE (plain
         stretch, no letterboxing). Returns {"objectType", "score", "box":
         (x1,y1,x2,y2)} in IMG_SIZE pixel space, sorted by score descending.
         """
-        # NHWC uint8 -> NCHW float32 [1,3,H,W], normalized to [0,1].
+        # NHWC uint8 -> NCHW float [1,3,H,W], normalized to [0,1].
         chw = frame_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-        batched = chw[np.newaxis, ...]
+        batched = chw[np.newaxis, ...].astype(self._in_dtype)
         with self._lock:
             outputs = self._session.run(None, {self._input_name: batched})
-        boxes, classes, scores = _post_process(outputs, self._anchors)
+        outputs = [np.asarray(o, dtype=np.float32) for o in outputs]
+        if self._mode == "ultralytics":
+            boxes, classes, scores = _post_process_ultralytics(outputs[0])
+        else:
+            boxes, classes, scores = _post_process(outputs, self._anchors)
         if boxes is None:
             return []
         results = []

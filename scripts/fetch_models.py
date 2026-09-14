@@ -9,6 +9,7 @@ binaries are not stored in this repo (see README).
   python3 scripts/fetch_models.py --convert  # also build the .rknn (needs rknn-toolkit2, x86)
 """
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -18,6 +19,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZOO = "https://raw.githubusercontent.com/airockchip/rknn_model_zoo/v2.3.2"
 ONNX_URL = ("https://ftrg.zbox.filez.com/v2/delivery/data/"
             "95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx")
+# Small CPU model for the x86 variant: the official Ultralytics YOLOv5n ONNX
+# export (decode baked in -> one [1,N,85] output). ~3.8 MiB vs the Rockchip
+# yolov5s export's ~28.9 MiB, and materially faster on CPU.
+YOLOV5N_URL = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx"
+YOLOV5N_SHA256 = "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"
 UA = {"User-Agent": "piport-fetch-models"}
 
 # target dirs, keyed by short name
@@ -48,6 +54,17 @@ def download(url, dest, force=False):
     print(f"got {dest}")
 
 
+def _verify_sha256(path, expected):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    got = digest.hexdigest()
+    if got != expected:
+        sys.exit(f"error: {path} sha256 {got} != expected {expected}")
+    print(f"verified {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -61,10 +78,14 @@ def main():
         for t in targets:
             download(url, os.path.join(DIRS[t], name), args.force)
 
-    # ONNX goes to the x86 variant and the conversion workspace (not the NPU dir).
-    onnx = os.path.join(DIRS["rknn_convert"], "yolov5s_relu.onnx")
-    for t in ("rknn_convert", "x86_models"):
-        download(ONNX_URL, os.path.join(DIRS[t], "yolov5s_relu.onnx"), args.force)
+    # Rockchip yolov5s_relu ONNX: only the .rknn conversion workspace needs it
+    # now (the x86 variant uses the smaller Ultralytics yolov5n below).
+    download(ONNX_URL, os.path.join(DIRS["rknn_convert"], "yolov5s_relu.onnx"), args.force)
+
+    # Small CPU model for the x86 variant (gitignored binary, sha256-pinned).
+    npath = os.path.join(DIRS["x86_models"], "yolov5n.onnx")
+    download(YOLOV5N_URL, npath, args.force)
+    _verify_sha256(npath, YOLOV5N_SHA256)
 
     subset_list = os.path.join(DIRS["rknn_convert"], "coco_subset_20.txt")
     with open(subset_list) as f:

@@ -18,6 +18,25 @@ except Exception as exc:  # numpy missing, etc.
     _IMPORT_ERR = exc
 
 
+def _load_x86_detector():
+    """Import the x86 variant without onnxruntime: its module import is
+    lazy-loaded (numpy only), so the pure math is testable off-device."""
+    import importlib.util
+    path = os.path.join(_ROOT, "x86", "detector.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("x86_detector_under_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+x86_detector = _load_x86_detector()
+
+
 @unittest.skipIf(detector is None, f"detector unavailable ({_IMPORT_ERR})")
 class TestMapObjectType(unittest.TestCase):
     def test_mapping(self):
@@ -79,6 +98,52 @@ class TestPostProcess(unittest.TestCase):
         x1, y1, x2, y2 = boxes[0]
         self.assertLessEqual(x1, x2)
         self.assertLessEqual(y1, y2)
+
+
+@unittest.skipIf(detector is None, f"detector unavailable ({_IMPORT_ERR})")
+class TestNMS(unittest.TestCase):
+    """Regression guard for _nms_boxes: a missing '+ w[others]'/'+ h[others]'
+    term makes the intersection always zero, so NMS silently keeps every
+    duplicate detection."""
+
+    def setUp(self):
+        import numpy as np
+        self.np = np
+
+    def _check(self, mod):
+        np = self.np
+        dup = np.array([[0, 0, 10, 10], [0, 0, 10, 10], [100, 100, 110, 110]], dtype=np.float32)
+        self.assertEqual(len(mod._nms_boxes(dup, np.array([0.9, 0.8, 0.7], np.float32))), 2)
+        heavy = np.array([[0, 0, 10, 10], [1, 1, 11, 11]], dtype=np.float32)
+        self.assertEqual(len(mod._nms_boxes(heavy, np.array([0.9, 0.8], np.float32))), 1)
+        light = np.array([[0, 0, 10, 10], [5, 5, 15, 15]], dtype=np.float32)
+        self.assertEqual(len(mod._nms_boxes(light, np.array([0.9, 0.8], np.float32))), 2)
+
+    def test_rk3588(self):
+        self._check(detector)
+
+    @unittest.skipIf(x86_detector is None, "x86 detector unavailable")
+    def test_x86(self):
+        self._check(x86_detector)
+
+
+@unittest.skipIf(x86_detector is None, "x86 detector unavailable")
+class TestX86Ultralytics(unittest.TestCase):
+    """The Ultralytics [1,N,85] output (xywh + obj + class scores, decode baked
+    in) must dedupe via NMS and map to the AI-Port vocabulary."""
+
+    def test_duplicate_suppressed(self):
+        import numpy as np
+        out = np.zeros((1, 3, 85), dtype=np.float32)
+        for row in (0, 1):  # two identical strong class-0 (person) boxes
+            out[0, row, :4] = [320, 320, 100, 100]
+            out[0, row, 4] = 0.9
+            out[0, row, 5] = 0.9
+        boxes, classes, scores = x86_detector._post_process_ultralytics(out)
+        self.assertIsNotNone(boxes)
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(int(classes[0]), 0)
+        self.assertAlmostEqual(float(scores[0]), 0.81, places=5)
 
 
 if __name__ == "__main__":
