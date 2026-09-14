@@ -1,0 +1,18 @@
+# Build context for piport/x86. Keep the gitignored ONNX (models/*.onnx) IN.
+__pycache__/
+*.pyc
+.venv/
+venv/
+instances/
+adopt_state.json
+adopt_state.json.tmp
+server.crt
+server.key
+*.pem
+*.log
+.git/
+.gitignore
+README.md
+Dockerfile
+docker-compose*.yml
+run-smoke-test.sh

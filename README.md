@@ -162,15 +162,20 @@ address instead of DHCP.
 
 ```bash
 cd piport/x86
-python3 ../scripts/fetch_models.py          # x86/models/yolov5s_relu.onnx
+python3 ../../scripts/fetch_models.py       # -> x86/models/yolov5n.onnx
+./run-smoke-test.sh                          # fetch + build + start + verify
+
+# manual equivalent:
 docker build -t piport-x86 .
-docker run --rm --cap-add=NET_ADMIN --network host piport-x86 --iface eth0
+docker run --rm --cap-add=NET_ADMIN --network host piport-x86
 ```
 
-For multiple instances use `docker-compose.yml` (macvlan) rather than the
-default bridge, which breaks L2 discovery. **The Dockerfile has not been built
-by the author (no Docker daemon available at time of writing) — treat the
-first build as its first test.** See `piport/x86/README.md`.
+`docker-compose.yml` is the single-instance host-network test;
+`docker-compose.macvlan.yml` is the multi-instance sketch (macvlan, not the
+default bridge, which breaks L2 discovery). **The Dockerfile has still not been
+built by the author (no Docker daemon in the authoring environment) —
+`run-smoke-test.sh` on an x86 host is the first real test.** See
+`piport/x86/README.md`.
 
 ### Operational notes
 
@@ -182,13 +187,18 @@ first build as its first test.** See `piport/x86/README.md`.
 
 ## Model assets (not tracked)
 
-The detector needs an open YOLOv5s model. Because it is a large binary and is
-reproducible, it is not committed; `scripts/fetch_models.py` downloads it:
+The detector needs an open YOLOv5 model. Because the binaries are large and
+reproducible, they are not committed; `scripts/fetch_models.py` downloads them:
 
-| Asset | Source |
-|---|---|
-| `yolov5s_relu.onnx` | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
-| anchors, COCO labels, bus.jpg, calibration subset | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
+| Asset | Used by | Source |
+|---|---|---|
+| `yolov5n.onnx` (3.8 MiB) | x86/CPU variant | Ultralytics release: <https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx> |
+| `yolov5s_relu.onnx` (28.9 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
+| anchors, COCO labels, bus.jpg, calibration subset | both | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
+
+The x86 variant defaults to `yolov5n.onnx`; it still accepts the Rockchip
+`yolov5s_relu.onnx` via `AIPORT_MODEL_PATH` (both output layouts are
+auto-detected). The Ultralytics model is AGPL-3.0, same as the weights.
 
 `yolov5s_relu.rknn` is produced on an x86_64 machine with `rknn-toolkit2`
 (install from PyPI or the Rockchip GitHub release — see

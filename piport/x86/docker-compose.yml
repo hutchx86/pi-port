@@ -1,29 +1,20 @@
-# Illustrative, untested. Uses a native Docker macvlan network (not the
-# default bridge+NAT) so the L2 discovery beacon is visible on the real LAN
-# and the console can reach :443 directly.
+# Single-instance smoke test with host networking: the L2 discovery beacon
+# (:10001/udp) and control API (:443) land on the real LAN, and run_all.py
+# auto-detects the host's route interface. For multiple instances or a distinct
+# IP, use docker-compose.macvlan.yml.
 #
-# Before use: set `parent` to the real host NIC, pick real unique --mac
-# values, and note the host cannot reach macvlan container IPs by default.
+#   python3 ../../scripts/fetch_models.py
+#   docker compose up --build
 services:
-  aiport-main:
+  aiport:
     build: .
-    container_name: piport-main
-    command:
-      - "--iface=eth0"
-      - "--mac=FCECDA000001"   # placeholder -- replace with a real, unique value
-      - "--hostname=piport-x86"
-    networks:
-      lan:
-        ipv4_address: 192.0.2.230  # placeholder -- pick a real free LAN address
+    image: piport-x86
+    container_name: piport-x86
+    network_mode: host
+    restart: unless-stopped
     cap_add:
-      - NET_ADMIN   # for interface/ARP handling; trim if unneeded
-
-networks:
-  lan:
-    driver: macvlan
-    driver_opts:
-      parent: eth0   # <-- replace with the real host NIC connected to the LAN
-    ipam:
-      config:
-        - subnet: 192.0.2.0/24
-          gateway: 192.0.2.1
+      - NET_ADMIN
+    # The image ships aiport.cfg as a template. For a real console (UNVR)
+    # address and identity, mount your own configured copy:
+    # volumes:
+    #   - ./aiport.cfg:/app/aiport.cfg:ro

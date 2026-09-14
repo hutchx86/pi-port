@@ -1,0 +1,37 @@
+# Multi-instance / dedicated-IP deployment: a native Docker macvlan network
+# (not the default bridge+NAT) so the L2 discovery beacon is visible on the LAN
+# and the console can reach each container's :443 directly.
+#
+# Before use:
+#   - set `parent` below to the real host NIC on the LAN;
+#   - give every service a UNIQUE --mac and --device-id (two containers sharing
+#     either look like one AI Port);
+#   - pick real, free LAN addresses.
+# Note: with macvlan the host itself cannot reach the container IPs without an
+# extra macvlan shim interface on the host. This file is illustrative -- the
+# host-network compose is the one to smoke-test first.
+services:
+  aiport-main:
+    build: .
+    image: piport-x86
+    container_name: piport-main
+    command:
+      - "--mac=FCECDA000001"                                # placeholder, unique
+      - "--device-id=00000000-0000-4000-8000-000000000001"  # placeholder, unique
+      - "--hostname=piport-x86"
+    networks:
+      lan:
+        ipv4_address: 192.0.2.230  # placeholder -- pick a real free LAN address
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0   # <-- replace with the real host NIC connected to the LAN
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          gateway: 192.0.2.1
