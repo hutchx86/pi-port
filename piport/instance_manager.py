@@ -190,6 +190,20 @@ def _write_and_start_unit(entry):
         raise InstanceError(f"systemd failed to start the instance: {r.stderr.strip()}")
 
 
+def refresh_instance(name):
+    """Rewrite and restart an existing instance's unit from the registry,
+    picking up the current interpreter (sys.executable) and paths while
+    preserving identity (MAC/device-id). Used by scripts/install.sh so a unit
+    created earlier with a different Python ends up under the venv."""
+    reg = _load_registry()
+    entry = reg.get(name)
+    if not entry:
+        raise InstanceError(f"no such instance {name!r}")
+    _write_and_start_unit(entry)
+    _systemctl("restart", _unit_name(name))
+    return {**entry, "name": name, "running": True}
+
+
 def create_instance(name, parent_iface=None, ip=None, netmask=None, gateway=None):
     if not NAME_RE.match(name):
         raise InstanceError(
@@ -339,11 +353,16 @@ def main():
     p_destroy = sub.add_parser("destroy")
     p_destroy.add_argument("name")
 
+    p_refresh = sub.add_parser("refresh",
+                               help="rewrite an existing instance's unit (current interpreter/"
+                                    "paths) and restart it, preserving its identity")
+    p_refresh.add_argument("name")
+
     sub.add_parser("list")
 
     args = ap.parse_args()
 
-    if os.geteuid() != 0 and args.cmd in ("create", "destroy"):
+    if os.geteuid() != 0 and args.cmd in ("create", "destroy", "refresh"):
         sys.exit(f"{args.cmd} needs root (creates/deletes network interfaces and systemd units)")
 
     try:
@@ -354,6 +373,9 @@ def main():
         elif args.cmd == "destroy":
             destroy_instance(args.name)
             print(f"destroyed {args.name!r}")
+        elif args.cmd == "refresh":
+            entry = refresh_instance(args.name)
+            print(json.dumps(entry, indent=2))
         elif args.cmd == "list":
             print(json.dumps(list_instances(), indent=2))
     except InstanceError as e:
