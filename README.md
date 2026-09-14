@@ -44,7 +44,8 @@ piport/            the emulator (RK3588 / Orange Pi)
   models/            anchors + COCO labels (model binaries fetched, not stored)
   instance_manager.py / run_all.py  multi-instance orchestration
   x86/               x86/no-NPU Docker variant (onnxruntime on CPU)
-scripts/           deployment helpers + fetch_models.py (model assets)
+scripts/           install.sh (one-shot installer) + deployment helpers +
+                   fetch_models.py (model assets)
 rknn_convert/      YOLOv5s -> RKNN conversion recipe (x86 build host)
 ```
 
@@ -60,6 +61,32 @@ here; see *Model assets* below.
 
 The x86 variant needs Docker and runs `onnxruntime` on CPU instead of the
 NPU; no Rockchip hardware required.
+
+## One-shot install (RK3588 / Orange Pi)
+
+On the board itself, one script does the whole stand-up — system packages, a
+venv + dependencies, model assets, the required `librknnrt.so` upgrade, a
+reboot-surviving systemd instance (via `instance_manager.py`), and the web UI:
+
+```bash
+sudo scripts/install.sh --console <UNVR-IP> [--parent-iface enP4p65s0]
+```
+
+Prerequisites/details:
+
+- Run from the checkout root, as root. `--parent-iface` defaults to the
+  auto-detected default-route NIC.
+- The NPU model `yolov5s_relu.rknn` cannot be built on the Pi (the RKNN
+  converter is x86_64-only). Build it on an x86 host with
+  `scripts/fetch_models.py --convert`, or let the installer fetch it from
+  `--rknn-url` / `PIPORT_RKNN_URL` / its `DEFAULT_RKNN_URL`. `--rknn <path>`
+  takes a local build, and a local `models-rknn/` submodule is also detected.
+  Use `--no-npu` for a CPU-only protocol-stack install.
+- Opens the web UI on `:8090` (`--webui-port` to change) for board stats and
+  instance management.
+
+The manual steps below are what the installer automates, if you prefer them
+by hand.
 
 ## Quick start (RK3588)
 
@@ -171,8 +198,21 @@ reproducible, it is not committed; `scripts/fetch_models.py` downloads it:
 python3 scripts/fetch_models.py --convert
 ```
 
-The model derives from Ultralytics YOLOv5 (AGPL-3.0) via Rockchip's model zoo;
-check those licenses before redistributing it.
+`scripts/install.sh` resolves the prebuilt `.rknn` in this order: `--rknn
+<path>`, a local copy at `models-rknn/` (e.g. a git submodule of a separate
+model repo) or `rknn_convert/`, then a download from `--rknn-url` /
+`PIPORT_RKNN_URL` / its `DEFAULT_RKNN_URL`. It verifies the pinned sha256 where
+one applies (always for the default URL). The default source is the separate
+AGPL-3.0 model repo
+[`hutchx86/pi-port-models`](https://github.com/hutchx86/pi-port-models) (tag
+`v1`); the model is never committed to this repo.
+
+**Model license.** The model derives from Ultralytics YOLOv5 (AGPL-3.0) via
+Rockchip's model zoo (Apache-2.0), so any redistributed `.rknn` is an AGPL-3.0
+work, separate from this repository's GPL-3.0-only source. If you redistribute
+it, include the AGPL-3.0 text and attribution; the corresponding source is this
+repo's conversion recipe plus the ONNX in the table above. Check those licenses
+yourself before redistributing.
 
 ## Verification
 

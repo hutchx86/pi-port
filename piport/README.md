@@ -155,6 +155,15 @@ inline comments, so keep comments on their own line.
 
 ## Quick start on the Orange Pi
 
+One-shot installer (system packages, venv, deps, model assets, `librknnrt.so`
+upgrade, a reboot-surviving systemd instance and the web UI):
+
+```bash
+sudo ../scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
+```
+
+The manual equivalent:
+
 ```bash
 pip install -r requirements.txt
 pip install rknn-toolkit-lite2   # see "Real object detection" below first
