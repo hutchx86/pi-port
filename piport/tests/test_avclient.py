@@ -1,0 +1,314 @@
+"""Unit tests for avclient.py's pure logic: geometry, zone/line
+parsing + crossing, snapshots. No sockets/device; ffmpeg tests skipped if absent.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import avclient as av  # noqa: E402
+
+_FFMPEG = shutil.which(av.FFMPEG_BIN) or (av.FFMPEG_BIN if os.path.exists(av.FFMPEG_BIN) else None)
+
+SQUARE = [(0, 0), (10, 0), (10, 10), (0, 10)]  # note: normalized 0-1000 in real use
+
+
+def make_frame(path, w=1920, h=1080):
+    subprocess.run([av.FFMPEG_BIN, "-loglevel", "error", "-f", "lavfi",
+                    "-i", f"testsrc=size={w}x{h}", "-frames:v", "1", "-y", path],
+                   check=True, capture_output=True)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        av._lines.clear()
+        av._detect_zones.clear()
+        av._exclude_zones.clear()
+        av._snapshot_filename_to_device.clear()
+        av._recent_snapshot_announcements.clear()
+        av._last_object_coord_by_device.clear()
+        av._snapshot_seq_by_device.clear()
+        av._stream_dims.clear()
+        av._active_streams.clear()
+        self.sent = []
+        self._orig_send = av.send_msg
+        av.send_msg = lambda ws, fn, payload, **kw: self.sent.append((fn, payload))
+        self.addCleanup(lambda: setattr(av, "send_msg", self._orig_send))
+
+
+class TestGeometry(unittest.TestCase):
+    def test_point_in_polygon(self):
+        self.assertTrue(av._point_in_polygon(5, 5, SQUARE))
+        self.assertFalse(av._point_in_polygon(15, 5, SQUARE))
+        self.assertFalse(av._point_in_polygon(-1, 5, SQUARE))
+        # concave polygon (an L) -- the ray-cast must not treat the notch as inside
+        L = [(0, 0), (10, 0), (10, 4), (4, 4), (4, 10), (0, 10)]
+        self.assertTrue(av._point_in_polygon(2, 2, L))
+        self.assertFalse(av._point_in_polygon(8, 8, L))
+
+    def test_zone_center_norm(self):
+        self.assertEqual(av._zone_center_norm([0, 0, 10, 20]), (5.0, 10.0))
+        self.assertEqual(av._zone_center_norm([100, 200, 50, 50]), (125.0, 225.0))
+
+    def test_iou(self):
+        self.assertAlmostEqual(av._iou([0, 0, 10, 10], [0, 0, 10, 10]), 1.0)
+        self.assertEqual(av._iou([0, 0, 10, 10], [100, 100, 10, 10]), 0.0)
+        # half-overlap on x: inter=50, union=150
+        self.assertAlmostEqual(av._iou([0, 0, 10, 10], [5, 0, 10, 10]), 50 / 150)
+
+    def test_line_side_sign(self):
+        p1, p2 = (0, 500), (1000, 500)
+        self.assertLess(av._line_side(p1, p2, (500, 100)), 0)
+        self.assertGreater(av._line_side(p1, p2, (500, 900)), 0)
+        self.assertEqual(av._line_side(p1, p2, (500, 500)), 0)
+
+    def test_segment_crosses_line(self):
+        p1, p2 = (0, 500), (1000, 500)
+        self.assertTrue(av._segment_crosses_line((500, 100), (500, 900), p1, p2))
+        self.assertTrue(av._segment_crosses_line((500, 900), (500, 100), p1, p2))
+        self.assertFalse(av._segment_crosses_line((500, 100), (600, 200), p1, p2))
+        self.assertFalse(av._segment_crosses_line((100, 600), (900, 600), p1, p2))
+        # movement crosses y=500 but outside the segment's x-span
+        self.assertFalse(av._segment_crosses_line((900, 100), (900, 900), (0, 500), (100, 500)))
+
+
+class TestParsers(Base):
+    def test_parse_zones(self):
+        field = {"1": {"coord": [0, 0, 10, 0, 10, 10, 0, 10]},
+                 "2": {"coord": [1, 2, 3, 4]},          # too few points -> skipped
+                 "3": {"coord": [0, 0, 1, 1, 2, 2, 3]}}  # odd -> skipped
+        polys = av._parse_zones(field)
+        self.assertEqual(len(polys), 1)
+        self.assertEqual(polys[0], [(0, 0), (10, 0), (10, 10), (0, 10)])
+        self.assertEqual(av._parse_zones(None), [])
+
+    def test_parse_lines_coord_and_points(self):
+        lines = av._parse_lines({
+            "1": {"coord": [0, 500, 1000, 500], "objectTypes": ["person"]},
+            "2": {"points": [[100, 0], [100, 1000]]},
+            "3": {"coord": [1, 2]},  # skipped
+        })
+        self.assertEqual([l["id"] for l in lines], ["1", "2"])
+        self.assertEqual((lines[0]["p1"], lines[0]["p2"]), ((0, 500), (1000, 500)))
+        self.assertEqual(lines[0]["object_types"], ["person"])
+        self.assertEqual(lines[1]["p2"], (100, 1000))
+
+    def test_line_ref(self):
+        self.assertEqual(av._line_ref("1"), 1)
+        self.assertEqual(av._line_ref("a"), "a")
+
+
+class TestZoneFiltering(Base):
+    def test_exclude_and_detect_zones(self):
+        av._exclude_zones["M"] = [SQUARE]
+        self.assertTrue(av._is_excluded("M", [4, 4, 2, 2]))    # center (5,5)
+        self.assertFalse(av._is_excluded("M", [40, 40, 2, 2]))  # center (41,41)
+        self.assertFalse(av._is_excluded("OTHER", [4, 4, 2, 2]))  # no zones -> not excluded
+
+        av._detect_zones["M2"] = [SQUARE]
+        self.assertFalse(av._is_outside_detect_zones("M2", [4, 4, 2, 2]))  # inside
+        self.assertTrue(av._is_outside_detect_zones("M2", [40, 40, 2, 2]))  # outside
+        self.assertFalse(av._is_outside_detect_zones("M3", [40, 40, 2, 2]))  # unset -> no restriction
+
+
+class TestLineCrossing(Base):
+    LINE = {"id": "1", "p1": (0, 500), "p2": (1000, 500),
+            "direction": None, "object_types": None}
+
+    def _track(self, prev):
+        return {"event_id": 7, "objectType": "person", "coord": [480, 80, 40, 40],
+                "score": 0.9, "first_shown_ms": 1000, "miss_count": 0,
+                "prev_center": prev, "crossed_lines": {}}
+
+    def test_enter_then_moving_and_counters(self):
+        av._lines["M"] = [self.LINE]
+        tr = self._track((500, 100))
+        av._process_line_crossings(None, "M", 3, tr, (500, 900))  # neg -> pos
+        p = self.sent[-1][1]
+        self.assertEqual(self.sent[-1][0], "EventSmartDetect")
+        self.assertEqual(p["edgeType"], "enter")
+        self.assertIn("linesStatus", p)
+        self.assertNotIn("zonesStatus", p)
+        self.assertEqual(p["descriptors"][0]["crosslineA2B"], 1)
+        self.assertEqual(p["descriptors"][0]["crosslineB2A"], 0)
+        self.assertEqual(p["descriptors"][0]["crosslineA2BAdd"], 1)
+        ev = p["eventId"]
+
+        # _motion_tick advances prev_center between ticks; do the same here
+        tr["prev_center"] = (500, 900)
+        av._process_line_crossings(None, "M", 3, tr, (500, 100))  # pos -> neg
+        p = self.sent[-1][1]
+        self.assertEqual(p["edgeType"], "moving")
+        self.assertEqual(p["eventId"], ev)  # same track event
+        self.assertEqual(p["linesStatus"]["1"]["direction"], "B2A")
+
+    def test_no_crossing_emits_nothing(self):
+        av._lines["M"] = [self.LINE]
+        tr = self._track((500, 100))
+        av._process_line_crossings(None, "M", 3, tr, (520, 110))
+        self.assertEqual(self.sent, [])
+
+    def test_object_type_filter(self):
+        av._lines["M"] = [dict(self.LINE, object_types=["vehicle"])]
+        tr = self._track((500, 100))
+        av._process_line_crossings(None, "M", 3, tr, (500, 900))
+        self.assertEqual(self.sent, [])
+
+    def test_leave_payload_and_filenames(self):
+        av._stream_dims["M"] = (1920, 1080)
+        av._send_line_detect_event(None, "M", self.LINE, "leave", 42, "A2B", 1, 2,
+                                   "person", [480, 80, 40, 40], 0.9, 1000, 3)
+        _, p = self.sent[-1]
+        self.assertEqual(p["edgeType"], "leave")
+        self.assertEqual(p["trackerIDAttrMap"]["3"], {"objectType": "person", "line": [1]})
+        self.assertTrue(p["smartDetectSnapshotFullFoV"].startswith("smartdetectsnap_line_"))
+        self.assertTrue(p["smartDetectSnapshotFullFoV"].endswith("_fullfov.jpg"))
+        self.assertEqual(p["smartDetectSnapshots"][0]["smartDetectSnapshotWidth"],
+                         av.SMART_SNAPSHOT_SIZE)
+        for fname in (p["smartDetectSnapshotFullFoV"],
+                      p["smartDetectSnapshots"][0]["smartDetectSnapshot"]):
+            self.assertEqual(av._snapshot_filename_to_device[fname]["device_id"], "M")
+        json.dumps(p)  # must be JSON-serialisable
+
+
+class TestSnapshotResolution(Base):
+    def test_resolve_by_filename(self):
+        av._record_snapshot_filename("f.jpg", "AAA", kind="fullfov")
+        rec, how = av._resolve_snapshot_device("f.jpg", None)
+        self.assertEqual((rec["device_id"], how), ("AAA", "filename"))
+
+    def test_resolve_sole_active_stream(self):
+        av._active_streams["AAA"] = object()
+        rec, how = av._resolve_snapshot_device(None, "smartDetectZoneSnapshot")
+        self.assertEqual((rec["device_id"], how), ("AAA", "sole active stream"))
+
+    def test_resolve_sole_recent_announcement(self):
+        av._active_streams["AAA"] = object()
+        av._active_streams["BBB"] = object()
+        av._record_snapshot_filename("b.jpg", "BBB", kind="object", coord=[1, 2, 3, 4])
+        rec, how = av._resolve_snapshot_device(None, "smartDetectZoneSnapshot")
+        self.assertEqual((rec["device_id"], how), ("BBB", "sole recent announcement"))
+        self.assertEqual(rec["coord"], [1, 2, 3, 4])  # reuses last object coord
+
+    def test_resolve_ambiguous_refuses(self):
+        av._active_streams["AAA"] = object()
+        av._active_streams["BBB"] = object()
+        av._record_snapshot_filename("a.jpg", "AAA", kind="object", coord=[1, 2, 3, 4])
+        av._record_snapshot_filename("b.jpg", "BBB", kind="object", coord=[1, 2, 3, 4])
+        rec, how = av._resolve_snapshot_device(None, "smartDetectZoneSnapshot")
+        self.assertIsNone(rec)
+        self.assertIsNone(how)
+
+    def test_fallback_kind_from_what(self):
+        self.assertEqual(av._fallback_record("X", "smartDetectZoneSnapshotFullFoV")["kind"], "fullfov")
+        self.assertEqual(av._fallback_record("X", "smartDetectZoneSnapshot")["kind"], "object")
+
+    def test_wait_for_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "no.jpg")
+            t = time.monotonic()
+            self.assertFalse(av._wait_for_frame(missing, timeout=0.4))
+            self.assertGreaterEqual(time.monotonic() - t, 0.3)
+            late = os.path.join(d, "late.jpg")
+            threading.Timer(0.2, lambda: open(late, "wb").write(b"x")).start()
+            self.assertTrue(av._wait_for_frame(late, timeout=2.0))
+
+
+class TestSnapshotUpload(Base):
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+    def _with_stream(self, *devices):
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        for dev in devices:
+            with open(os.path.join(self._dir, f"{dev}.jpg"), "wb") as f:
+                f.write(b"\xff\xd8\xff\xd9" + dev.encode())
+        self._orig_dir = av._STREAM_DIR
+        av._STREAM_DIR = self._dir
+        self.addCleanup(lambda: setattr(av, "_STREAM_DIR", self._orig_dir))
+        self.posted = []
+        self._orig_post = av.requests.post
+        av.requests.post = lambda uri, headers=None, files=None, **kw: (
+            self.posted.append(files["payload"][1]) or self._Resp())
+        self.addCleanup(lambda: setattr(av.requests, "post", self._orig_post))
+
+    INFO = {"mac_nosep": "X", "type": "UVC AI Port", "sysid_hex": "0xa5f1"}
+
+    def test_fullfov_uploads_full_frame(self):
+        self._with_stream("AAA")
+        av._record_snapshot_filename("full.jpg", "AAA", kind="fullfov")
+        av._upload_snapshot("https://c/upload/t", self.INFO, "full.jpg", "smartDetectZoneSnapshotFullFoV")
+        self.assertEqual(len(self.posted), 1)
+        self.assertTrue(self.posted[0].endswith(b"AAA"))
+
+    def test_unknown_ambiguous_refuses(self):
+        self._with_stream("AAA", "BBB")
+        av._active_streams["AAA"] = object()
+        av._active_streams["BBB"] = object()
+        av._upload_snapshot("https://c/upload/t", self.INFO, None, "smartDetectZoneSnapshot")
+        self.assertEqual(self.posted, [])
+
+    def test_unknown_sole_stream_falls_back(self):
+        self._with_stream("AAA")
+        av._active_streams["AAA"] = object()
+        av._upload_snapshot("https://c/upload/t", self.INFO, None, "smartDetectZoneSnapshot")
+        self.assertEqual(len(self.posted), 1)
+        self.assertTrue(self.posted[0].endswith(b"AAA"))
+
+    def test_no_uri_noop(self):
+        self._with_stream("AAA")
+        av._upload_snapshot(None, self.INFO, "x", "snapshot")
+        self.assertEqual(self.posted, [])
+
+
+class TestCrop(unittest.TestCase):
+    @unittest.skipUnless(_FFMPEG, "ffmpeg not available")
+    def test_crop_produces_square(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "frame.jpg")
+            make_frame(src)
+            data = av._crop_snapshot_jpeg(src, [400, 400, 200, 200], 1920, 1080)
+            self.assertIsNotNone(data)
+            self.assertTrue(data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"))
+            # Assert the JPEG is non-trivial and exercise crop math for corner
+            # cases rather than re-decoding dimensions.
+            for coord in ([0, 0, 100, 150], [950, 950, 50, 50], [0, 0, 1000, 1000], [500, 500, 5, 5]):
+                self.assertIsNotNone(av._crop_snapshot_jpeg(src, coord, 1920, 1080), coord)
+
+    @unittest.skipUnless(_FFMPEG, "ffmpeg not available")
+    def test_crop_bad_input_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "bad.jpg")
+            open(bad, "wb").write(b"not a jpeg")
+            self.assertIsNone(av._crop_snapshot_jpeg(bad, [1, 2, 3, 4], 1920, 1080))
+
+
+class TestConfigHandler(Base):
+    INFO = {"mac_nosep": "X", "type": "UVC AI Port", "sysid_hex": "0xa5f1"}
+
+    def test_change_smart_detect_settings(self):
+        msg = {"functionName": "ChangeSmartDetectSettings", "messageId": 1,
+               "responseExpected": True,
+               "payload": {"deviceID": "MAC", "zones": {}, "excludeZones": {},
+                           "lines": {"1": {"coord": [0, 250, 1000, 250]},
+                                     "2": {"coord": [250, 0, 250, 1000]}}}}
+        av.handle_function(None, msg, self.INFO)
+        self.assertEqual(len(av._lines["MAC"]), 2)
+        self.assertEqual(av._lines["MAC"][0]["p1"], (0, 250))
+        self.assertEqual(self.sent[-1][0], "ChangeSmartDetectSettings")
+
+
+if __name__ == "__main__":
+    unittest.main()

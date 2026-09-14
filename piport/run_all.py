@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Runs the discovery + adopt-HTTP + ucp4-client + classic-avclient stages
+together. Needs root (binds :10001, :443). Settings come from aiport.cfg;
+per-instance overrides are passed through to every stage.
+
+Usage:
+  sudo python3 run_all.py --iface eth0
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+import config
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def main():
+    cfg = config.load_config_and_logging(sys.argv[1:])
+    ap = argparse.ArgumentParser()
+    config.add_common_flags(ap)
+    ap.add_argument("--iface", default=None,
+                     help="interface to bind/derive identity from; defaults to cfg [network] iface, "
+                          "else the default-route interface (auto-detected)")
+    ap.add_argument("--bind-ip", default="0.0.0.0")
+    ap.add_argument("--mac", default=None,
+                     help="defaults to a real Ubiquiti OUI (FC:EC:DA) + the interface's own "
+                          "last 3 octets, not the interface's real (non-Ubiquiti) MAC")
+    ap.add_argument("--hostname", default=cfg["hostname"])
+    ap.add_argument("--fallback-host-port", default=None)
+    ap.add_argument("--state-dir", default=None,
+                     help="isolate this instance's adopt_state.json/certs/streams under a "
+                          "dedicated directory instead of the shared default paths -- "
+                          "required when running more than one AI Port instance on the same "
+                          "box (see instance_manager.py)")
+    ap.add_argument("--device-id", default=cfg["device_id"],
+                     help="AI Port's own device identity (shared by ucp4_client.py and "
+                          "avclient.py -- 'same physical device'); defaults to the "
+                          "cfg value, which MUST be unique per instance when running more "
+                          "than one")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        sys.exit("run_all.py needs root (binds ports 10001, 443)")
+
+    args.iface = config.resolve_iface(args.iface, cfg)
+    print(f"Using interface {args.iface}")
+
+    if args.mac is None:
+        args.mac = config.resolve_mac(args.iface, None, cfg)
+        print(f"No --mac given; using MAC {args.mac}")
+
+    # Bind the interface's own IP, not 0.0.0.0: a wildcard :443 would block
+    # other instances' :443. Falls back to 0.0.0.0 if resolution fails.
+    if args.bind_ip == "0.0.0.0":
+        resolved = config.resolve_ip(args.iface, cfg)
+        if resolved and resolved != "0.0.0.0":
+            args.bind_ip = resolved
+            print(f"No --bind-ip given; using {args.iface}'s own IP {resolved}")
+        else:
+            print(f"WARNING: could not resolve {args.iface}'s IP, binding 0.0.0.0 -- "
+                  f"this instance will collide with any other instance's :443/:10001")
+
+    # Per-stage flags that must reach every child process.
+    common = []
+    if args.config:
+        common += ["--config", args.config]
+    if args.debug:
+        common += ["--debug"]
+
+    beacon_args = [sys.executable, os.path.join(HERE, "discovery.py"),
+                   "--iface", args.iface, "--bind-ip", args.bind_ip, "--hostname", args.hostname,
+                   *common]
+    http_args = [sys.executable, os.path.join(HERE, "http_api.py"),
+                 "--iface", args.iface, "--bind-ip", args.bind_ip, "--hostname", args.hostname,
+                 *common]
+    wss_args = [sys.executable, os.path.join(HERE, "ucp4_client.py"),
+                "--iface", args.iface, "--bind-ip", args.bind_ip, *common]
+    if args.fallback_host_port:
+        wss_args += ["--fallback-host-port", args.fallback_host_port]
+
+    classic_args = [sys.executable, os.path.join(HERE, "avclient.py"),
+                    "--iface", args.iface, "--bind-ip", args.bind_ip, "--hostname", args.hostname,
+                    *common]
+
+    if args.mac:
+        for a in (beacon_args, http_args, wss_args, classic_args):
+            a += ["--mac", args.mac]
+
+    if args.state_dir:
+        for a in (beacon_args, http_args, wss_args, classic_args):
+            a += ["--state-dir", args.state_dir]
+    if args.device_id:
+        # All stages must share one device-id, else multi-instance discover/info breaks.
+        http_args += ["--device-id", args.device_id]
+        wss_args += ["--device-id", args.device_id]
+        classic_args += ["--device-id", args.device_id]
+        beacon_args += ["--device-id", args.device_id]
+
+    procs = [
+        subprocess.Popen(beacon_args),
+        subprocess.Popen(http_args),
+        subprocess.Popen(wss_args),
+        subprocess.Popen(classic_args),
+    ]
+
+    print(f"Started {len(procs)} components. Ctrl-C to stop all.")
+    try:
+        for p in procs:
+            p.wait()
+    except KeyboardInterrupt:
+        for p in procs:
+            p.terminate()
+
+
+if __name__ == "__main__":
+    main()

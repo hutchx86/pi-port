@@ -1,0 +1,51 @@
+# Local secrets / agent vault (never published)
+devices.md
+.claude/settings.local.json
+
+# Internal working notes -- only README.md is published
+/CLAUDE.md
+/commands.md
+/disassembly.md
+/implementation.md
+/llm_decisions.md
+/other.md
+/protocol.md
+/todo.md
+/instructions.md
+/archive/
+
+# Stale pre-refactor copy
+/aiport-emu_subdir/
+
+# Reverse-engineering material: firmware images, extracted trees, vendor binaries
+/fw-download/
+/fw_extract/
+/fw_picked/
+/fw_disassembly/
+/file_downloads/
+/repos/
+
+# Model binaries and conversion build artifacts (regenerated per README)
+*.bin
+*.img
+*.onnx
+*.rknn
+/rknn_convert/.venv/
+/rknn_convert/*.whl
+/rknn_convert/bus.jpg
+/rknn_convert/subset/
+
+# Python
+__pycache__/
+*.pyc
+
+# Windows metadata
+*:Zone.Identifier
+
+# Runtime scratch / generated device state
+/piport/instances/
+adopt_state.json
+adopt_state.json.tmp
+server.crt
+server.key
+run_all.log

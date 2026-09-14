@@ -1,0 +1,29 @@
+# Illustrative, untested. Uses a native Docker macvlan network (not the
+# default bridge+NAT) so the L2 discovery beacon is visible on the real LAN
+# and the console can reach :443 directly.
+#
+# Before use: set `parent` to the real host NIC, pick real unique --mac
+# values, and note the host cannot reach macvlan container IPs by default.
+services:
+  aiport-main:
+    build: .
+    container_name: piport-main
+    command:
+      - "--iface=eth0"
+      - "--mac=FCECDA000001"   # placeholder -- replace with a real, unique value
+      - "--hostname=piport-x86"
+    networks:
+      lan:
+        ipv4_address: 192.0.2.230  # placeholder -- pick a real free LAN address
+    cap_add:
+      - NET_ADMIN   # for interface/ARP handling; trim if unneeded
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0   # <-- replace with the real host NIC connected to the LAN
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          gateway: 192.0.2.1

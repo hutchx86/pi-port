@@ -1,0 +1,1231 @@
+#!/usr/bin/env python3
+"""Second WebSocket connection AI Port needs alongside ucp4: the classic camera
+"avclient" protocol.
+
+The controller's pairing/stream pool only includes connections that do NOT
+negotiate "ucp4" and that carry camera-mac plus camera-model = literal hex
+sysid "0xa5f1". Wire protocol: wss://<host>:7442/camera/1.0/ws[?token=],
+subprotocol secure_transfer over mTLS, headers camera-mac/camera-ip/
+camera-model/camera-firmware/device-id/x-guid/adopted plus
+Origin: http://ws_camera_proto_secure_transfer, and plain JSON in BINARY
+frames starting with "ubnt_avclient_hello".
+"""
+import argparse
+import collections
+import itertools
+import json
+import logging
+import os
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+import requests
+import urllib3
+from websockets.sync.client import connect
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+log = logging.getLogger("aiport-avclient")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
+CERT_PATH = os.path.join(HERE, "server.crt")
+KEY_PATH = os.path.join(HERE, "server.key")
+_PROCESS_START_MS = int(time.time() * 1000)
+
+_msg_id_counter = itertools.count(1)
+
+# deviceID -> subprocess.Popen pulling its RTSP stream from Protect's relay
+# (not the paired camera directly).
+_active_streams = {}
+# tmpfs dir ffmpeg rewrites each camera's snapshot JPEG into (never persistent
+# storage).
+_STREAM_DIR = config.stream_dir()
+# deviceID -> consecutive unexpected-death count since the last fresh
+# UiStreamControl start.
+_stream_restart_count = {}
+
+# Prefer nyanmisaka/ffmpeg-rockchip (H.264 via RKVDEC; mainline rkmpp wedges
+# once MPP's queue fills); fall back to system ffmpeg.
+FFMPEG_BIN = ("/usr/local/ffmpeg-rkmpp/bin/ffmpeg"
+              if os.path.exists("/usr/local/ffmpeg-rkmpp/bin/ffmpeg") else "ffmpeg")
+_HWDEC_ARGS = ["-c:v", "h264_rkmpp"] if FFMPEG_BIN != "ffmpeg" else []
+
+# Real motion detection: periodic YOLOv5s/RKNN classification of the latest
+# frame (no scene-diff pre-filter); objects tracked by IOU within objectType,
+# each with its own trackerID/eventId and enter/moving/leave lifecycle.
+_motion_state = {}   # deviceID -> {"tracks": {trackerID: {...}}, "next_tracker_id": int}
+_motion_lock = threading.Lock()
+_motion_poll_stop = {}  # deviceID -> threading.Event, signals the poll loop to stop
+_event_id_counter = itertools.count(int(time.time()))  # monotonic, avoids same-second collisions across tracks
+MOTION_POLL_INTERVAL_S = 1.5
+# Consecutive empty ticks before a track is declared lost (~30s); YOLOv5s
+# drops lying-down subjects often.
+MOTION_MISS_TOLERANCE_TICKS = 20
+# Min IOU (same objectType) to match a detection to an existing track.
+IOU_MATCH_THRESHOLD = 0.3
+# Paired camera's smartDetectZones row id -- zonesStatus's key must match it;
+# not always "1".
+SMART_DETECT_ZONE_ID = "1"
+
+# RK3588 NPU YOLOv5s (detector.py); ffmpeg decodes to 640x640
+# raw RGB, latest frame only.
+_latest_frame = {}   # deviceID -> HxWx3 uint8 numpy array (640x640, RGB)
+_frame_lock = threading.Lock()
+_stream_dims = {}    # deviceID -> (width, height) of the real camera stream
+# deviceID -> exclusion polygons in the normalized 0-1000 space.
+_exclude_zones = {}
+# Prototype app exposes `zones` (not excludeZones): when non-default, a
+# detection must fall inside one to count.
+_detect_zones = {}
+# deviceID -> configured Line Crossing segments parsed from
+# ChangeSmartDetectSettings.lines.
+_lines = {}
+_snapshot_seq_by_device = {}  # deviceID -> monotonic counter for fullfov snapshot filenames
+# Filename -> {"device_id", "kind": "fullfov"|"object", "coord"} so an upload
+# maps back to its camera; bounded to avoid leaks.
+_snapshot_filename_to_device = collections.OrderedDict()
+_SNAPSHOT_FILENAME_MAP_MAX = 500
+# (monotonic_time, deviceID) per announced snapshot, fallback only when the
+# GetRequest has no/unknown filename.
+SNAPSHOT_FALLBACK_WINDOW_S = 60
+_recent_snapshot_announcements = collections.deque(maxlen=32)
+# deviceID -> last announced per-object coord, so a filename-less fallback can
+# still crop.
+_last_object_coord_by_device = {}
+DETECT_IMG_SIZE = 640  # must match detector.py's IMG_SIZE
+# Per-object snapshot: square crop centered on the detection, scaled to this
+# size (ffmpeg does it).
+SMART_SNAPSHOT_SIZE = 512
+SMART_SNAPSHOT_MARGIN = 1.6
+# descriptors[].coord and all derived geometry use normalized 0-1000, not
+# stream pixels (controller clamps to [0,1000]).
+CAMERA_COORD_END = 1000
+_detector = None
+_detector_lock = threading.Lock()
+
+
+def _get_detector():
+    global _detector
+    with _detector_lock:
+        if _detector is None:
+            from detector import Detector
+            _detector = Detector()
+        return _detector
+
+
+def build_ssl_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+    return ctx
+
+
+def send_msg(ws, functionName, payload, to="ubnt_avclient", in_response_to=None,
+             response_expected=False, from_="UniFiVideo"):
+    msg = {
+        "from": from_,
+        "to": to,
+        "functionName": functionName,
+        "messageId": next(_msg_id_counter),
+        # ds's serde requires `timeStamp` on every message, as an RFC3339
+        # string (a unix-ms integer is rejected).
+        "timeStamp": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+        "responseExpected": response_expected,
+        # ds's serde requires `inResponseTo` on EVERY message, including
+        # unsolicited pushes -- omitting it made ds drop every EventSmartDetect
+        # push with "missing field `inResponseTo`". 0 = "not a response".
+        "inResponseTo": in_response_to if in_response_to is not None else 0,
+    }
+    # The controller sends/expects plain JSON as BINARY websocket frames
+    # (opcode 0x2), not text -- mirror that exactly.
+    ws.send(json.dumps(msg).encode())
+    log.info(">>> sent %s (id=%s) payload=%s", functionName, msg["messageId"], payload)
+
+
+def _stop_stream(device_id):
+    proc = _active_streams.pop(device_id, None)
+    if proc and proc.poll() is None:
+        log.info("stopping RTSP pull for deviceID=%s (pid=%s)", device_id, proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    with _frame_lock:
+        _latest_frame.pop(device_id, None)
+
+
+# Single decode per camera: one ffmpeg pulls the RTSP stream and splits it
+# (after decode) into two software-compatible branches -- a 1/2-fps JPEG
+# snapshot and 2-fps 640x640 raw RGB frames. Decoding twice was measurably
+# wasteful: the CPU-side H.264 slice/NAL parsing that RKVDEC needs fed
+# dominates cost (a `dec0:N` thread at ~27% of a core per 1080p25 stream),
+# not the hardware macroblock decode. `mjpeg_rkmpp` accepts software frames,
+# unlike the hw-only `scale_rkrga` filter.
+def _start_stream(device_id, ip, port, uri, width=None, height=None):
+    _stop_stream(device_id)
+    os.makedirs(_STREAM_DIR, exist_ok=True)
+    _stream_dims[device_id] = (width or DETECT_IMG_SIZE, height or DETECT_IMG_SIZE)
+    url = f"rtsp://{ip}:{port}/{uri}"
+    out_path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
+    encode_args = ["-c:v", "mjpeg_rkmpp"] if _HWDEC_ARGS else []
+    size = DETECT_IMG_SIZE
+    cmd = [
+        FFMPEG_BIN, "-loglevel", "warning", "-rtsp_transport", "tcp",
+        *_HWDEC_ARGS, "-i", url,
+        "-filter_complex",
+        f"[0:v]split=2[snapin][detin];"
+        f"[snapin]fps=1/2[snap];[detin]fps=2,scale={size}:{size}[det]",
+        "-map", "[snap]", *encode_args, "-update", "1", "-y", out_path,
+        "-map", "[det]", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+    ]
+    log.info("starting merged RTSP pull for deviceID=%s: %s", device_id, url)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _active_streams[device_id] = proc
+    frame_bytes = size * size * 3
+
+    def _reader():
+        import numpy as np
+        try:
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape((size, size, 3))
+                with _frame_lock:
+                    _latest_frame[device_id] = frame
+        except Exception:
+            log.exception("frame reader crashed for deviceID=%s", device_id)
+        rc = proc.wait()
+        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        log.info("merged RTSP pull for deviceID=%s exited rc=%s stderr_tail=%s",
+                  device_id, rc, stderr[-500:])
+        # Only auto-restart on an UNEXPECTED death -- _stop_stream() pops the
+        # device from _active_streams before killing it for an intentional
+        # stop, so still finding `proc` here means the RTSP pull died on its
+        # own (e.g. Protect's relay dropping with "End of file"). No cap on
+        # retries (this project stays up rather than giving up on a device).
+        if _active_streams.get(device_id) is proc:
+            _active_streams.pop(device_id, None)
+            # Retry fast (0.5s) for the first few attempts: Protect tears down
+            # and rebuilds its ingest pipeline for a newly-consumed
+            # third-party camera (~2-3s), so a fixed 2s backoff often lost the
+            # race (pairing failed on the first Save). Fall back to 2s for
+            # longer-lived failures so we don't spawn ffmpeg in a tight loop.
+            # The counter resets on a fresh UiStreamControl start.
+            count = _stream_restart_count.get(device_id, 0) + 1
+            _stream_restart_count[device_id] = count
+            backoff = 0.5 if count <= 6 else 2.0
+            log.warning("deviceID=%s RTSP pull died unexpectedly (attempt %d), restarting in %.1fs",
+                        device_id, count, backoff)
+            time.sleep(backoff)
+            if device_id not in _active_streams:
+                _start_stream(device_id, ip, port, uri, width, height)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+def _point_in_polygon(x, y, polygon):
+    """Ray-casting point-in-polygon test (zone coord is 4 free, non-axis-aligned points)."""
+    inside = False
+    n = len(polygon)
+    x1, y1 = polygon[-1]
+    for i in range(n):
+        x2, y2 = polygon[i]
+        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
+            inside = not inside
+        x1, y1 = x2, y2
+    return inside
+
+
+def _zone_center_norm(coord):
+    """Center of a [x, y, w, h] box in normalized 0-1000 space."""
+    x, y, w, h = coord
+    return x + w / 2, y + h / 2
+
+
+def _is_excluded(device_id, coord):
+    """True if the detection box center falls inside any configured excludeZones."""
+    polygons = _exclude_zones.get(device_id)
+    if not polygons:
+        return False
+    cx, cy = _zone_center_norm(coord)
+    return any(_point_in_polygon(cx, cy, poly) for poly in polygons)
+
+
+def _is_outside_detect_zones(device_id, coord):
+    """True if the detection center is outside all configured `zones` (no zones
+    means no restriction)."""
+    polygons = _detect_zones.get(device_id)
+    if not polygons:
+        return False
+    cx, cy = _zone_center_norm(coord)
+    return not any(_point_in_polygon(cx, cy, poly) for poly in polygons)
+
+
+def _classify_frame_detections(device_id):
+    """Return all qualifying detections for the latest frame as
+    {objectType, score, coord} in normalized 0-1000 space, sorted by score;
+    [] if none."""
+    with _frame_lock:
+        frame = _latest_frame.get(device_id)
+    if frame is None:
+        return []
+    try:
+        detector = _get_detector()
+        results = detector.detect(frame)
+    except Exception:
+        log.exception("classification failed for deviceID=%s", device_id)
+        return []
+    # Detector's 640 buffer is a resolution-independent stretch, so scale
+    # straight to 0-1000.
+    s = CAMERA_COORD_END / DETECT_IMG_SIZE
+    out = []
+    for r in results:
+        x1, y1, x2, y2 = r["box"]
+        coord = [max(0, x1 * s), max(0, y1 * s), max(1, (x2 - x1) * s), max(1, (y2 - y1) * s)]
+        if _is_excluded(device_id, coord):
+            log.info("real motion tick: %s detection excluded by configured excludeZones for "
+                      "deviceID=%s (score=%.2f)", r["objectType"], device_id, r["score"])
+            continue
+        if _is_outside_detect_zones(device_id, coord):
+            log.info("real motion tick: %s detection outside all configured detection zones for "
+                      "deviceID=%s (score=%.2f)", r["objectType"], device_id, r["score"])
+            continue
+        out.append({"objectType": r["objectType"], "score": r["score"], "coord": coord})
+    return out
+
+
+def _iou(box_a, box_b):
+    """Intersection-over-union of two [x, y, w, h] boxes."""
+    ax1, ay1, aw, ah = box_a
+    bx1, by1, bw, bh = box_b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _parse_zones(zones_field):
+    """Parse ChangeSmartDetectSettings zones/excludeZones into polygons
+    (even-length coord, >= 3 points)."""
+    polygons = []
+    for zone in (zones_field or {}).values():
+        coord = zone.get("coord") or []
+        if len(coord) >= 6 and len(coord) % 2 == 0:
+            polygons.append(list(zip(coord[0::2], coord[1::2])))
+    return polygons
+
+
+def _parse_lines(lines_field):
+    """Parse ChangeSmartDetectSettings.lines into 2-point segments (normalized
+    0-1000; a `points` fallback is accepted)."""
+    out = []
+    for line_id, line in (lines_field or {}).items():
+        if not isinstance(line, dict):
+            continue
+        pts = []
+        coord = line.get("coord") or []
+        if len(coord) >= 4 and len(coord) % 2 == 0:
+            pts = list(zip(coord[0::2], coord[1::2]))
+        else:
+            for pt in (line.get("points") or []):
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    pts.append((pt[0], pt[1]))
+        if len(pts) < 2:
+            continue
+        out.append({
+            "id": str(line_id),
+            "p1": pts[0],
+            "p2": pts[-1],
+            "direction": line.get("direction") or line.get("crosslineDirection"),
+            "object_types": line.get("objectTypes") or line.get("object_types"),
+        })
+    return out
+
+
+def _line_ref(line_id):
+    """Return a numeric line id when numeric, else the string (controller keys
+    numeric ids as numbers)."""
+    s = str(line_id)
+    return int(s) if s.isdigit() else s
+
+
+def _line_side(p1, p2, pt):
+    """Sign of the cross product: which side of directed line p1->p2 `pt` is on."""
+    return (p2[0] - p1[0]) * (pt[1] - p1[1]) - (p2[1] - p1[1]) * (pt[0] - p1[0])
+
+
+def _segment_crosses_line(prev, cur, p1, p2):
+    """True if segment prev->cur crosses segment p1->p2."""
+    d1 = _line_side(p1, p2, prev)
+    d2 = _line_side(p1, p2, cur)
+    d3 = _line_side(prev, cur, p1)
+    d4 = _line_side(prev, cur, p2)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _process_line_crossings(ws, device_id, tracker_id, tr, new_center):
+    """Emit a smartDetectLine event for each configured line this movement
+    crosses (first crossing = enter, later = moving)."""
+    lines = _lines.get(device_id)
+    prev_center = tr.get("prev_center")
+    if not lines or prev_center is None:
+        return
+    for line in lines:
+        types = line.get("object_types")
+        if types and tr["objectType"] not in types:
+            continue
+        if not _segment_crosses_line(prev_center, new_center, line["p1"], line["p2"]):
+            continue
+        direction = "A2B" if _line_side(line["p1"], line["p2"], prev_center) < 0 else "B2A"
+        entry = tr.setdefault("crossed_lines", {}).setdefault(line["id"], {
+            "a2b": 0, "b2a": 0, "direction": direction, "event_id": None,
+        })
+        entry["a2b" if direction == "A2B" else "b2a"] += 1
+        entry["direction"] = direction
+        edge_type = "moving" if entry["event_id"] is not None else "enter"
+        if entry["event_id"] is None:
+            entry["event_id"] = next(_event_id_counter)
+        log.info("line crossing: %s crossed line %s (%s, a2b=%d b2a=%d) for deviceID=%s "
+                  "tracker_id=%s -- sending %s", tr["objectType"], line["id"], direction,
+                  entry["a2b"], entry["b2a"], device_id, tracker_id, edge_type)
+        try:
+            _send_line_detect_event(ws, device_id, line, edge_type, entry["event_id"],
+                                    direction, entry["a2b"], entry["b2a"],
+                                    tr["objectType"], tr["coord"], tr["score"],
+                                    tr["first_shown_ms"], tracker_id)
+        except Exception:
+            log.exception("failed to send line %s event for tracker_id=%s deviceID=%s",
+                          line["id"], tracker_id, device_id)
+
+
+def _motion_tick(ws, device_id):
+    detections = _classify_frame_detections(device_id)
+    with _motion_lock:
+        dev = _motion_state.setdefault(device_id, {"tracks": {}, "next_tracker_id": 1})
+        tracks = dev["tracks"]
+        unclaimed = list(range(len(detections)))
+
+        # IOU is only for disambiguating multiple same-type candidates; with
+        # one track and one detection, match unconditionally.
+        type_track_count = collections.Counter(tr["objectType"] for tr in tracks.values())
+        type_detect_count = collections.Counter(d["objectType"] for d in detections)
+
+        # 1. Match each track to its best remaining same-type detection by IOU.
+        for tracker_id, tr in list(tracks.items()):
+            unambiguous = (type_track_count[tr["objectType"]] == 1
+                            and type_detect_count[tr["objectType"]] == 1)
+            best_idx, best_iou = None, (-1.0 if unambiguous else IOU_MATCH_THRESHOLD)
+            for idx in unclaimed:
+                d = detections[idx]
+                if d["objectType"] != tr["objectType"]:
+                    continue
+                iou = _iou(tr["coord"], d["coord"])
+                if iou > best_iou:
+                    best_idx, best_iou = idx, iou
+            if best_idx is not None:
+                d = detections[best_idx]
+                unclaimed.remove(best_idx)
+                tr["coord"] = d["coord"]
+                tr["score"] = d["score"]
+                tr["miss_count"] = 0
+                # Line Crossing: check this tick's movement against configured lines.
+                new_center = _zone_center_norm(d["coord"])
+                _process_line_crossings(ws, device_id, tracker_id, tr, new_center)
+                tr["prev_center"] = new_center
+                # Push a "moving" update to keep the open event's
+                # smartDetectTypes/score populated.
+                try:
+                    _send_smart_detect_event(ws, device_id, edge_type="moving", event_id=tr["event_id"],
+                                              stationary=False, object_type=tr["objectType"],
+                                              coord=tr["coord"], confidence=tr["score"],
+                                              first_shown_ms=tr["first_shown_ms"], tracker_id=tracker_id)
+                except Exception:
+                    log.exception("failed to send moving update for tracker_id=%s deviceID=%s",
+                                  tracker_id, device_id)
+                continue
+            # No matching detection this tick for this track.
+            tr["miss_count"] += 1
+            if tr["miss_count"] < MOTION_MISS_TOLERANCE_TICKS:
+                # Within the tolerance window -- send nothing, keep the track.
+                log.info("real motion tick: no match (miss %d/%d) for tracker_id=%s deviceID=%s -- "
+                          "tolerating brief gap, track still open", tr["miss_count"],
+                          MOTION_MISS_TOLERANCE_TICKS, tracker_id, device_id)
+                continue
+            # Missed enough consecutive ticks -- this track is genuinely gone.
+            log.info("real motion tick: no detection for %d consecutive ticks, closing smartDetectZone "
+                      "track for deviceID=%s tracker_id=%s event_id=%s (last seen: %s score=%.2f)",
+                      MOTION_MISS_TOLERANCE_TICKS, device_id, tracker_id, tr["event_id"],
+                      tr["objectType"], tr["score"])
+            try:
+                _send_smart_detect_event(ws, device_id, edge_type="leave", event_id=tr["event_id"],
+                                          stationary=True, object_type=tr["objectType"], coord=tr["coord"],
+                                          confidence=tr["score"], first_shown_ms=tr["first_shown_ms"],
+                                          tracker_id=tracker_id)
+            except Exception:
+                log.exception("failed to send leave for tracker_id=%s deviceID=%s", tracker_id, device_id)
+            # Close any line events this track opened, mirroring the zone lifecycle.
+            for line_id, entry in tr.get("crossed_lines", {}).items():
+                if entry["event_id"] is None:
+                    continue
+                line = next((l for l in _lines.get(device_id, []) if l["id"] == line_id), None)
+                if line is None:
+                    continue
+                try:
+                    _send_line_detect_event(ws, device_id, line, "leave", entry["event_id"],
+                                            entry["direction"], entry["a2b"], entry["b2a"],
+                                            tr["objectType"], tr["coord"], tr["score"],
+                                            tr["first_shown_ms"], tracker_id)
+                except Exception:
+                    log.exception("failed to send line leave for line=%s tracker_id=%s deviceID=%s",
+                                  line_id, tracker_id, device_id)
+            del tracks[tracker_id]
+
+        # 2. Any unclaimed detection opens a new track with its own
+        # trackerID/eventId.
+        for idx in unclaimed:
+            d = detections[idx]
+            tracker_id = dev["next_tracker_id"]
+            dev["next_tracker_id"] += 1
+            event_id = next(_event_id_counter)
+            first_shown_ms = int(time.time() * 1000)
+            tracks[tracker_id] = {"event_id": event_id, "objectType": d["objectType"],
+                                    "coord": d["coord"], "score": d["score"],
+                                    "first_shown_ms": first_shown_ms, "miss_count": 0,
+                                    "prev_center": _zone_center_norm(d["coord"]),
+                                    "crossed_lines": {}}
+            log.info("real motion tick: %s detected (score=%.2f), opening smartDetectZone track "
+                      "for deviceID=%s tracker_id=%s event_id=%s", d["objectType"], d["score"],
+                      device_id, tracker_id, event_id)
+            try:
+                _send_smart_detect_event(ws, device_id, edge_type="enter", event_id=event_id,
+                                          stationary=False, object_type=d["objectType"],
+                                          coord=d["coord"], confidence=d["score"],
+                                          first_shown_ms=first_shown_ms, tracker_id=tracker_id)
+            except Exception:
+                log.exception("failed to send enter for tracker_id=%s deviceID=%s", tracker_id, device_id)
+
+        if not detections and not tracks:
+            # Tick with nothing detectable = non-smart motion
+            # (lighting/noise); ignore.
+            log.info("real motion tick: scene changed but no person/vehicle/animal found "
+                      "for deviceID=%s -- ignoring (not smart-detect-worthy)", device_id)
+
+
+def _stop_motion_detector(device_id):
+    with _motion_lock:
+        _motion_state.pop(device_id, None)
+    ev = _motion_poll_stop.pop(device_id, None)
+    if ev:
+        ev.set()
+
+
+def _start_motion_detector(ws, device_id, ip, port, uri):
+    # Runs the classifier periodically on the latest frame; no scene-diff
+    # pre-filter (unreliable, and NPU inference is cheap).
+    _stop_motion_detector(device_id)
+    stop_event = threading.Event()
+    _motion_poll_stop[device_id] = stop_event
+
+    def _poll_loop():
+        while not stop_event.wait(MOTION_POLL_INTERVAL_S):
+            try:
+                _motion_tick(ws, device_id)
+            except Exception:
+                log.exception("motion poll tick crashed for deviceID=%s", device_id)
+
+    log.info("starting real motion detector (periodic classification, every %.1fs) for deviceID=%s",
+              MOTION_POLL_INTERVAL_S, device_id)
+    threading.Thread(target=_poll_loop, daemon=True).start()
+
+
+def _record_snapshot_filename(filename, device_id, kind, coord=None):
+    _snapshot_filename_to_device[filename] = {
+        "device_id": device_id, "kind": kind, "coord": coord,
+    }
+    while len(_snapshot_filename_to_device) > _SNAPSHOT_FILENAME_MAP_MAX:
+        _snapshot_filename_to_device.popitem(last=False)
+    # Record for the fallback; collapse consecutive repeats from one leave
+    # (two filenames).
+    if not _recent_snapshot_announcements or _recent_snapshot_announcements[-1][1] != device_id:
+        _recent_snapshot_announcements.append((time.monotonic(), device_id))
+    if kind == "object" and coord:
+        _last_object_coord_by_device[device_id] = coord
+
+
+def _resolve_snapshot_device(requested_filename, what):
+    """Resolve a snapshot GetRequest to a camera; returns (record, how), record
+    None if ambiguous. Falls back only to a sole active stream or sole recent
+    announcement."""
+    record = _snapshot_filename_to_device.get(requested_filename)
+    if record is not None:
+        return record, "filename"
+    now = time.monotonic()
+    recent = [dev for t, dev in _recent_snapshot_announcements
+              if now - t <= SNAPSHOT_FALLBACK_WINDOW_S]
+    distinct = list(dict.fromkeys(recent))
+    active = list(_active_streams)
+    if len(active) == 1:
+        return _fallback_record(active[0], what), "sole active stream"
+    if len(distinct) == 1:
+        return _fallback_record(distinct[0], what), "sole recent announcement"
+    log.warning("snapshot upload requested for unknown filename=%r (what=%r): %d active "
+                "stream(s), %d distinct camera(s) announced in the last %ds -- ambiguous, "
+                "refusing to guess", requested_filename, what, len(active), len(distinct),
+                SNAPSHOT_FALLBACK_WINDOW_S)
+    return None, None
+
+
+def _fallback_record(device_id, what):
+    # `what` gives full-FoV vs per-object; an object request reuses the last
+    # coord so the crop still matches.
+    kind = "fullfov" if "fullfov" in str(what or "").lower() else "object"
+    coord = _last_object_coord_by_device.get(device_id) if kind == "object" else None
+    return {"device_id": device_id, "kind": kind, "coord": coord}
+
+
+def _crop_snapshot_jpeg(src_path, coord, fov_w, fov_h):
+    """Square object-crop JPEG centered on the 0-1000 coord, scaled to
+    SMART_SNAPSHOT_SIZE (ffmpeg); None on failure."""
+    x, y, w, h = coord
+    cx = (x + w / 2) / CAMERA_COORD_END * fov_w
+    cy = (y + h / 2) / CAMERA_COORD_END * fov_h
+    box_w = w / CAMERA_COORD_END * fov_w
+    box_h = h / CAMERA_COORD_END * fov_h
+    side = max(box_w, box_h) * SMART_SNAPSHOT_MARGIN
+    side = max(float(SMART_SNAPSHOT_SIZE), min(side, float(min(fov_w, fov_h))))
+    side = int(side) // 2 * 2  # even: required for yuvj420p JPEG dimensions
+    crop_x = max(0, min(int(round(cx - side / 2)), fov_w - side))
+    crop_y = max(0, min(int(round(cy - side / 2)), fov_h - side))
+    vf = f"crop={side}:{side}:{crop_x}:{crop_y},scale={SMART_SNAPSHOT_SIZE}:{SMART_SNAPSHOT_SIZE}"
+    try:
+        out = subprocess.run(
+            [FFMPEG_BIN, "-loglevel", "error", "-i", src_path, "-vf", vf,
+             "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
+            capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("snapshot crop failed for %s (coord=%s): %r", src_path, coord, e)
+        return None
+    if out.returncode != 0 or not out.stdout:
+        log.warning("snapshot crop produced no image for %s (coord=%s) rc=%s: %s",
+                    src_path, coord, out.returncode, out.stderr.decode(errors="replace")[-300:])
+        return None
+    return out.stdout
+
+
+def _wait_for_frame(path, timeout=2.0):
+    """Wait briefly for the snapshot JPEG; a missing thumbnail leaves the
+    event's detectedAreas empty."""
+    deadline = time.monotonic() + timeout
+    while not os.path.isfile(path):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def _upload_snapshot(upload_uri, device_info, requested_filename, what=None):
+    if not upload_uri:
+        log.warning("snapshot GetRequest had no uri, nothing to upload")
+        return
+    # Resolve filename -> camera and read that camera's frame (never guess
+    # from directory contents).
+    record, resolved_by = _resolve_snapshot_device(requested_filename, what)
+    if record is None:
+        return
+    device_id = record["device_id"]
+    if resolved_by != "filename":
+        log.warning("snapshot upload for unknown filename=%r (what=%r) resolved to deviceID=%s "
+                    "via %s", requested_filename, what, device_id, resolved_by)
+    path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
+    if not _wait_for_frame(path):
+        log.warning("snapshot upload requested for deviceID=%s (filename=%s) but no captured "
+                    "frame available yet at %s", device_id, requested_filename, path)
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        log.warning("failed to read %s for snapshot upload: %s", path, e)
+        return
+    if record["kind"] == "object" and record["coord"]:
+        fov_w, fov_h = _stream_dims.get(device_id, (DETECT_IMG_SIZE, DETECT_IMG_SIZE))
+        cropped = _crop_snapshot_jpeg(path, record["coord"], fov_w, fov_h)
+        if cropped is not None:
+            log.info("snapshot crop for deviceID=%s coord=%s -> %d bytes (from %d-byte full frame)",
+                      device_id, record["coord"], len(cropped), len(data))
+            data = cropped
+        else:
+            log.warning("snapshot crop failed for deviceID=%s, uploading full frame instead",
+                        device_id)
+    headers = {
+        "x-ident": device_info["mac_nosep"].upper(),
+        "x-type": device_info["type"],
+        "x-sysid": device_info["sysid_hex"],
+    }
+    files_form = {"payload": ("snapshot.jpg", data, "image/jpeg")}
+    try:
+        resp = requests.post(upload_uri, headers=headers, files=files_form,
+                              cert=(CERT_PATH, KEY_PATH), verify=False, timeout=15)
+        log.info("uploaded snapshot (%d bytes) from %s to %s -> %s: %s",
+                  len(data), path, upload_uri, resp.status_code, resp.text[:300])
+    except requests.RequestException as e:
+        log.warning("snapshot upload to %s failed: %r", upload_uri, e)
+
+
+def _send_smart_detect_event(ws, device_id, edge_type="none", event_id=1, stationary=False,
+                              object_type="person", coord=None, confidence=95,
+                              first_shown_ms=None, tracker_id=1):
+    # Real EventSmartDetect shape; deviceID is our addition (required by
+    # AI-Port event routing).
+    now_ms = int(time.time() * 1000)
+    # Placeholder box is only a fallback; tracks open on real detections.
+    real_coord = [int(round(v)) for v in coord] if coord is not None else [100, 100, 200, 200]
+    # firstShownTimeMs must stay at the track's first-seen time (recomputing
+    # makes it look like a new track).
+    first_shown = first_shown_ms if first_shown_ms is not None else now_ms
+    confidence_level = int(round(confidence * 100)) if confidence <= 1 else int(round(confidence))
+    # zonesStatus mirrors edgeType with a non-zero level; an empty one blocks
+    # add_smart_detect_types().
+    zone_status = "none" if edge_type == "none" else edge_type
+    zone_level = 0 if edge_type == "none" else confidence_level
+    payload = {
+        "deviceID": device_id,
+        "clockMonotonic": 0,
+        "clockStream": 0,
+        "clockStreamRate": 1000,
+        "clockWall": now_ms,
+        "descriptors": [{
+            "attributes": None,
+            "boxColor": "cyan",
+            "confidenceLevel": confidence_level,
+            "coord": real_coord,
+            "coord3d": [-1, -1],
+            "firstShownTimeMs": first_shown,
+            # Real capture had idleSinceTimeMs == firstShownTimeMs; per-tick
+            # semantics unconfirmed.
+            "idleSinceTimeMs": first_shown,
+            "intelligenceZones": [],
+            "lines": [],
+            "loiterZones": [],
+            "name": "",
+            "objectType": object_type,
+            "secondLensZones": [],
+            "stationary": stationary,
+            "tag": "",
+            "trackerID": tracker_id,
+            # Naming the zone makes ds create a smartDetectZone (vs
+            # smartDetectLine) event.
+            "zones": [int(SMART_DETECT_ZONE_ID)],
+        }],
+        "displayTimeoutMSec": 200,
+        "edgeType": edge_type,
+        "eventId": event_id,
+        # Top-level objectTypes; likely what add_smart_detect_types() reads.
+        "objectTypes": [object_type] if object_type else [],
+        "smartDetectSnapshotFullFoV": "",
+        "smartDetectSnapshotFullFoVHeight": 0,
+        "smartDetectSnapshotFullFoVWidth": 0,
+        "smartDetectSnapshots": [],
+        "zonesStatus": {SMART_DETECT_ZONE_ID: {"level": zone_level, "status": zone_status}},
+    }
+    # Other *Status fields are omitted: the real capture had only zonesStatus,
+    # and those detectors aren't implemented.
+    if edge_type == "leave":
+        # "leave" carries the track's final classification in trackerIDAttrMap
+        # (likely read by add_smart_detect_types()).
+        payload["trackerIDAttrMap"] = {
+            str(tracker_id): {"objectType": object_type, "zone": [int(SMART_DETECT_ZONE_ID)]}
+        }
+        # Full-FoV dims use the real stream resolution, not the square
+        # detection buffer.
+        seq = _snapshot_seq_by_device.get(device_id, 0) + 1
+        _snapshot_seq_by_device[device_id] = seq
+        fov_w, fov_h = _stream_dims.get(device_id, (DETECT_IMG_SIZE, DETECT_IMG_SIZE))
+        fullfov_filename = f"smartdetectsnap_zone_{seq:08d}_fullfov.jpg"
+        snapshot_filename = f"smartdetectsnap_zone_{tracker_id}{now_ms}.jpg"
+        _record_snapshot_filename(fullfov_filename, device_id, kind="fullfov")
+        _record_snapshot_filename(snapshot_filename, device_id, kind="object", coord=real_coord)
+        payload["smartDetectSnapshotFullFoV"] = fullfov_filename
+        payload["smartDetectSnapshotFullFoVHeight"] = fov_h
+        payload["smartDetectSnapshotFullFoVWidth"] = fov_w
+        payload["smartDetectSnapshots"] = [{
+            "clockBestMonotonic": 0,
+            "clockBestWall": first_shown,
+            "confidenceLevel": confidence_level,
+            "coord": real_coord,
+            "framingRect": real_coord,
+            "reVerifyEligible": False,
+            "smartDetectSnapshot": snapshot_filename,
+            # Matches the object-crop image, not the full frame.
+            "smartDetectSnapshotHeight": SMART_SNAPSHOT_SIZE,
+            "smartDetectSnapshotName": "",
+            "smartDetectSnapshotType": object_type,
+            "smartDetectSnapshotWidth": SMART_SNAPSHOT_SIZE,
+            "trackerID": tracker_id,
+        }]
+    send_msg(ws, "EventSmartDetect", payload, response_expected=False)
+
+
+def _send_line_detect_event(ws, device_id, line, edge_type, event_id, direction,
+                            a2b, b2a, object_type, coord, confidence,
+                            first_shown_ms, tracker_id):
+    """Line Crossing event: same envelope as the zone path but with
+    linesStatus, so the controller selects smartDetectLine."""
+    now_ms = int(time.time() * 1000)
+    real_coord = [int(round(v)) for v in coord] if coord is not None else [100, 100, 200, 200]
+    first_shown = first_shown_ms if first_shown_ms is not None else now_ms
+    confidence_level = int(round(confidence * 100)) if confidence <= 1 else int(round(confidence))
+    line_ref = _line_ref(line["id"])
+    stationary = edge_type == "leave"
+    zone_status = "none" if edge_type == "none" else edge_type
+    zone_level = 0 if edge_type == "none" else confidence_level
+    payload = {
+        "deviceID": device_id,
+        "clockMonotonic": 0,
+        "clockStream": 0,
+        "clockStreamRate": 1000,
+        "clockWall": now_ms,
+        "descriptors": [{
+            "attributes": None,
+            "boxColor": "cyan",
+            "confidenceLevel": confidence_level,
+            "coord": real_coord,
+            "coord3d": [-1, -1],
+            "firstShownTimeMs": first_shown,
+            "idleSinceTimeMs": first_shown,
+            "intelligenceZones": [],
+            "lines": [line_ref],
+            "loiterZones": [],
+            "name": "",
+            "objectType": object_type,
+            "secondLensZones": [],
+            "stationary": stationary,
+            "tag": "",
+            "trackerID": tracker_id,
+            "zones": [],
+            # Cumulative crossings; the real descriptor also carries
+            # per-crossing Add deltas.
+            "crosslineA2B": a2b,
+            "crosslineB2A": b2a,
+            "crosslineA2BAdd": 1 if direction == "A2B" else 0,
+            "crosslineB2AAdd": 1 if direction == "B2A" else 0,
+        }],
+        "displayTimeoutMSec": 200,
+        "edgeType": edge_type,
+        "eventId": event_id,
+        "objectTypes": [object_type] if object_type else [],
+        "smartDetectSnapshotFullFoV": "",
+        "smartDetectSnapshotFullFoVHeight": 0,
+        "smartDetectSnapshotFullFoVWidth": 0,
+        "smartDetectSnapshots": [],
+        "linesStatus": {str(line_ref): {
+            "level": zone_level,
+            "status": zone_status,
+            "direction": direction,
+            "crosslineA2B": a2b,
+            "crosslineB2A": b2a,
+        }},
+    }
+    if edge_type == "leave":
+        # Line event closes with trackerIDAttrMap naming the line (zone path
+        # uses "zone").
+        payload["trackerIDAttrMap"] = {
+            str(tracker_id): {"objectType": object_type, "line": [line_ref]},
+        }
+        seq = _snapshot_seq_by_device.get(device_id, 0) + 1
+        _snapshot_seq_by_device[device_id] = seq
+        fov_w, fov_h = _stream_dims.get(device_id, (DETECT_IMG_SIZE, DETECT_IMG_SIZE))
+        fullfov_filename = f"smartdetectsnap_line_{seq:08d}_fullfov.jpg"
+        snapshot_filename = f"smartdetectsnap_line_{tracker_id}{now_ms}.jpg"
+        _record_snapshot_filename(fullfov_filename, device_id, kind="fullfov")
+        _record_snapshot_filename(snapshot_filename, device_id, kind="object", coord=real_coord)
+        payload["smartDetectSnapshotFullFoV"] = fullfov_filename
+        payload["smartDetectSnapshotFullFoVHeight"] = fov_h
+        payload["smartDetectSnapshotFullFoVWidth"] = fov_w
+        payload["smartDetectSnapshots"] = [{
+            "clockBestMonotonic": 0,
+            "clockBestWall": first_shown,
+            "confidenceLevel": confidence_level,
+            "coord": real_coord,
+            "framingRect": real_coord,
+            "reVerifyEligible": False,
+            "smartDetectSnapshot": snapshot_filename,
+            "smartDetectSnapshotHeight": SMART_SNAPSHOT_SIZE,
+            "smartDetectSnapshotName": "",
+            "smartDetectSnapshotType": object_type,
+            "smartDetectSnapshotWidth": SMART_SNAPSHOT_SIZE,
+            "trackerID": tracker_id,
+        }]
+    send_msg(ws, "EventSmartDetect", payload, response_expected=False)
+
+
+def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready):
+    # Field names from the real ubnt_av_aiport string table;
+    # isSmartDetectReady gates AI-task dispatch.
+    send_msg(ws, "EventAIPortStatus", {
+        "deviceID": device_id,
+        "isPlug": plug,
+        "isStreaming": streaming,
+        "isSmartDetectReady": smart_ready,
+        "isAudioEventReady": audio_ready,
+    }, response_expected=False)
+
+
+def _send_feature_flags_event(ws, device_id):
+    # Device capability declaration; declared honestly as person/vehicle/animal
+    # (the detector's RKNN classes). lineCrossingCounting is off (not
+    # implemented).
+    send_msg(ws, "EventFeatureFlagsUpdated", {
+        "deviceID": device_id,
+        "smartDetect": ["person", "vehicle", "animal"],
+        "motionDetect": ["stable"],
+        "lineCrossing": True,
+        "lineCrossingCounting": False,
+        "mic": True,
+        "speaker": True,
+        "ledStatus": True,
+    }, response_expected=False)
+
+
+def handle_function(ws, msg, device_info):
+    fn = msg.get("functionName")
+    payload = msg.get("payload") or {}
+    msg_id = msg.get("messageId")
+    log.info("<<< received functionName=%r messageId=%s from=%r to=%r payload=%s",
+             fn, msg_id, msg.get("from"), msg.get("to"), payload)
+
+    if fn == "UiStreamControl":
+        device_id = payload.get("deviceID")
+        streaming = bool(payload.get("streaming"))
+        if streaming and payload.get("ip") and payload.get("port") and payload.get("uri"):
+            try:
+                # Fresh viewing session: reset the death-retry counter.
+                _stream_restart_count.pop(device_id, None)
+                _start_stream(device_id, payload["ip"], payload["port"], payload["uri"],
+                              payload.get("width", DETECT_IMG_SIZE),
+                              payload.get("height", DETECT_IMG_SIZE))
+                _start_motion_detector(ws, device_id, payload["ip"], payload["port"], payload["uri"])
+                reply_status = "started"
+            except Exception:
+                log.exception("failed to start RTSP pull for deviceID=%s", device_id)
+                reply_status = "stopped"
+        else:
+            if device_id:
+                _stop_stream(device_id)
+                _stop_motion_detector(device_id)
+            reply_status = "stopped"
+        # usedPoints MUST be on every reply (start and stop); omitting it breaks
+        # re-pairing with estimated_capacity_exceeded.
+        active_count = len(_active_streams)
+        reply = {"status": reply_status, "usedPoints": active_count * 2}
+        send_msg(ws, "UiStreamControl", reply, in_response_to=msg_id)
+        if device_id:
+            # smart_ready is the likely gate for AI-task dispatch.
+            _send_status_event(ws, device_id, plug=True,
+                                streaming=(reply_status == "started"),
+                                smart_ready=True, audio_ready=True)
+            if reply_status == "started":
+                _send_feature_flags_event(ws, device_id)
+        return
+    if fn == "OnvifStreamControl":
+        reply_status = "started" if payload.get("streaming") else "stopped"
+        send_msg(ws, "OnvifStreamControl", {"status": reply_status}, in_response_to=msg_id)
+        return
+    if fn == "GetStreamList":
+        # aiportUpdateHandler requires this to succeed before re-issuing
+        # UiStreamControl; reply needs `list`.
+        send_msg(ws, "GetStreamList", {"list": []}, in_response_to=msg_id)
+        return
+    if fn == "ChangeVideoSettings":
+        # A query, not a push: the controller builds its channel list from
+        # `.video`/`.audio`, so `{}` blocks provisioning.
+        send_msg(ws, "ChangeVideoSettings", {
+            "video": {
+                "video1": {"enabled": True, "width": 1920, "height": 1080,
+                           "fps": 25, "bitrate": 4000000},
+                "video2": {"enabled": False},
+                "video3": {"enabled": False},
+            },
+            "audio": {"enabled": False, "volume": 100},
+        }, in_response_to=msg_id)
+        return
+    if fn == "ChangeIspSettings":
+        # Same query-not-push pattern as ChangeVideoSettings; minimal
+        # best-effort shape.
+        send_msg(ws, "ChangeIspSettings", {
+            "irLedMode": "auto",
+            "wdr": 1,
+        }, in_response_to=msg_id)
+        return
+    if fn == "UpdateUsernamePassword":
+        # Password rotation request; just ack (not persisted) so the controller
+        # stops retrying.
+        send_msg(ws, "UpdateUsernamePassword", {}, in_response_to=msg_id)
+        return
+    if fn == "GetRequest" and "snapshot" in str(payload.get("what", "")).lower():
+        # Snapshot upload request (what may be snapshot/smartDetectZoneSnapshot/
+        # ...FullFoV); ack and upload in the background.
+        send_msg(ws, "GetRequest", {}, in_response_to=msg_id)
+        threading.Thread(target=_upload_snapshot,
+                          args=(payload.get("uri"), device_info, payload.get("filename"),
+                                payload.get("what")),
+                          daemon=True).start()
+        return
+
+    if fn == "ChangeSmartDetectSettings":
+        # Parses zones/excludeZones/lines (normalized 0-1000, arbitrary vertex
+        # lists); per-zone sensitivity isn't applied.
+        device_id = payload.get("deviceID")
+        if device_id:
+            _exclude_zones[device_id] = _parse_zones(payload.get("excludeZones"))
+            _detect_zones[device_id] = _parse_zones(payload.get("zones"))
+            _lines[device_id] = _parse_lines(payload.get("lines"))
+            log.info("ChangeSmartDetectSettings: deviceID=%s now has %d excludeZones "
+                      "polygon(s), %d detection-zone polygon(s), %d Line Crossing segment(s)",
+                      device_id, len(_exclude_zones[device_id]), len(_detect_zones[device_id]),
+                      len(_lines[device_id]))
+        if msg.get("responseExpected"):
+            send_msg(ws, fn, {}, in_response_to=msg_id)
+        return
+
+    if fn == "ResetToDefaults":
+        # Un-adopt signal: the controller doesn't close the WS afterward, so
+        # tear down here.
+        log.info("ResetToDefaults received -- treating as un-adopt: clearing "
+                  "adopt state and tearing down streams")
+        for device_id in list(_active_streams):
+            _stop_stream(device_id)
+            _stop_motion_detector(device_id)
+        _exclude_zones.clear()
+        _detect_zones.clear()
+        _lines.clear()
+        _clear_adopt_state()
+        if msg.get("responseExpected"):
+            send_msg(ws, fn, {}, in_response_to=msg_id)
+        log.info("closing this connection to force a fresh, honestly-unadopted reconnect")
+        ws.close()
+        return
+
+    # Unknown function: ack if a response is expected.
+    if msg.get("responseExpected"):
+        send_msg(ws, fn, {}, in_response_to=msg_id)
+
+
+def _is_adopted():
+    try:
+        with open(ADOPT_STATE_FILE) as f:
+            state = json.load(f)
+        return bool(state.get("token")) or bool(state.get("hosts"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _clear_adopt_state():
+    # Overwrite (not delete) adopt_state.json so concurrent readers never hit
+    # ENOENT.
+    try:
+        config.atomic_write_json(ADOPT_STATE_FILE, {})
+    except OSError:
+        log.warning("failed to clear adopt state file %s", ADOPT_STATE_FILE, exc_info=True)
+
+
+def _adopt_token():
+    try:
+        with open(ADOPT_STATE_FILE) as f:
+            return json.load(f).get("token")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# No wait-for-adopt gate: the unsolicited pre-adopt connection is load-bearing
+# for candidate identity.
+
+
+def run(host, port, device_info, token=None):
+    url = f"wss://{host}:{port}/camera/1.0/ws"
+    if token:
+        url += f"?token={token}"
+    # All headers are load-bearing: ds proxies the connection and closes
+    # incomplete sets.
+    headers = {
+        "camera-mac": device_info["mac_nosep"],
+        "camera-ip": device_info["ip"],
+        "camera-model": device_info["sysid_hex"],
+        "camera-firmware": device_info["version"],
+        "device-id": device_info["device_id"],
+        "x-guid": device_info["guid"],
+        "adopted": "true" if _is_adopted() else "false",
+        "Origin": "http://ws_camera_proto_secure_transfer",
+    }
+    log.info("connecting to %s headers=%s", url, headers)
+    ctx = build_ssl_context()
+    with connect(url, subprotocols=["secure_transfer"], additional_headers=headers,
+                 ssl=ctx, open_timeout=15) as ws:
+        log.info("CLASSIC AVCLIENT WSS CONNECTED (subprotocol=%s)", ws.subprotocol)
+        # hwrev must be non-null or hardwareRevision stays empty; 1 is a
+        # placeholder.
+        now_ms = int(time.time() * 1000)
+        send_msg(ws, "ubnt_avclient_hello", {
+            "mac": device_info["mac_nosep"],
+            "model": device_info["type"],
+            "name": device_info.get("hostname", "piport"),
+            "fwVersion": device_info["version"],
+            "connectionHost": device_info["ip"],
+            "connectionSecurePort": port,
+            "protocolVersion": 67,
+            "adoptionCode": _adopt_token(),
+            "ip": device_info["ip"],
+            "hwrev": 1,
+            "idleTime": 0,
+            "rebootTimeoutSec": 30,
+            "upgradeTimeoutSec": 150,
+            "semver": f"v{device_info['version']}",
+            "totalLoad": 0.1,
+            "uptime": (now_ms - _PROCESS_START_MS) // 1000,
+            "features": {
+                "smartDetect": ["person", "vehicle", "animal"],
+                "motionDetect": ["stable"],
+                "mic": True,
+                "speaker": True,
+                "ledStatus": True,
+            },
+        }, response_expected=True)
+
+        for raw in ws:
+            # Controller sends JSON as BINARY frames; decode bytes as UTF-8 JSON.
+            text = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError:
+                log.warning("non-JSON frame (%d bytes): %r", len(text), text[:200])
+                continue
+            if msg.get("inResponseTo"):
+                log.info("<<< response to our msg id=%s payload=%s",
+                          msg.get("inResponseTo"), msg.get("payload"))
+                continue
+            handle_function(ws, msg, device_info)
+
+
+def main():
+    cfg = config.load_config_and_logging(sys.argv[1:])
+    ap = argparse.ArgumentParser(description=__doc__)
+    config.add_common_flags(ap)
+    ap.add_argument("--iface", default=None,
+                     help="interface to derive identity from (never bound); defaults to cfg "
+                          "[network] iface, else the default-route interface (auto-detected)")
+    ap.add_argument("--mac", default=None)
+    ap.add_argument("--fallback-port", type=int, default=int(cfg["port"]),
+                     help="port to use when there's no real adopt state yet (dialing --host) "
+                          "or when adopt_state.json's hosts[0] entry doesn't include one of its "
+                          "own")
+    ap.add_argument("--host", default=cfg["host"],
+                     help="dial this unconditionally when there's no adopt state yet: the "
+                          "unsolicited pre-adopt handshake is required for the app to show the "
+                          "device as 'AI Port' rather than a generic/'Unknown' device (the L2 "
+                          "discovery beacon alone is not enough). It does NOT cause an un-adopted "
+                          "device to auto-re-adopt. See the note above run() before re-adding a "
+                          "wait-for-adopt gate.")
+    ap.add_argument("--type", default=cfg["platform"],
+                     help="catalog model string (see discovery.py's --platform help)")
+    ap.add_argument("--sysid-hex", default=cfg["sysid"])
+    ap.add_argument("--version", default=cfg["fw_version"])
+    ap.add_argument("--bind-ip", default="0.0.0.0")
+    ap.add_argument("--hostname", default=cfg["hostname"])
+    ap.add_argument("--device-id", default=cfg["device_id"],
+                     help="must match ucp4_client.py's --device-id -- same physical device")
+    # Fixed Ubiquiti catalog GUID for the "AI Port" SKU, not a per-device
+    # random ID.
+    ap.add_argument("--guid", default=cfg["guid"],
+                     help="must match ucp4_client.py's --guid -- same physical device")
+    ap.add_argument("--state-dir", default=None,
+                     help="where adopt_state.json/server.crt/server.key live -- "
+                          "defaults to the shared piport/ path (single-instance, "
+                          "unchanged behavior); set this to isolate a second/third AI "
+                          "Port instance running on the same box (see "
+                          "instance_manager.py) -- must match the other 3 processes' "
+                          "--state-dir for the same instance. Snapshot JPEGs always "
+                          "live in a tmpfs-backed dir (config.stream_dir), never on "
+                          "persistent storage")
+    args = ap.parse_args()
+    args.iface = config.resolve_iface(args.iface, cfg)
+
+    if args.state_dir:
+        global ADOPT_STATE_FILE, CERT_PATH, KEY_PATH, _STREAM_DIR
+        os.makedirs(args.state_dir, exist_ok=True)
+        ADOPT_STATE_FILE = os.path.join(args.state_dir, "adopt_state.json")
+        CERT_PATH = os.path.join(args.state_dir, "server.crt")
+        KEY_PATH = os.path.join(args.state_dir, "server.key")
+        # RAM-only handoff; http_api.py derives the same dir from --state-dir.
+        _STREAM_DIR = config.stream_dir(args.state_dir)
+
+    mac_nosep = config.resolve_mac(args.iface, args.mac, cfg).lower()
+    ip = config.resolve_ip(args.iface, cfg, args.bind_ip)
+
+    device_info = {
+        "mac_nosep": mac_nosep,
+        "type": args.type,
+        "sysid_hex": args.sysid_hex,
+        "version": args.version,
+        "ip": ip,
+        "hostname": args.hostname,
+        "device_id": args.device_id,
+        "guid": args.guid,
+    }
+
+    # Single-use token: present on first connect after adopt, omit on later
+    # reconnects.
+    used_tokens = set()
+
+    while True:
+        # Read adopt state if present but don't block; dial args.host pre-adopt.
+        try:
+            with open(ADOPT_STATE_FILE) as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        hosts = state.get("hosts") or []
+        if hosts:
+            host_port = hosts[0]
+            if ":" in host_port:
+                host, port_s = host_port.rsplit(":", 1)
+                port = int(port_s)
+            else:
+                host, port = host_port, args.fallback_port
+        else:
+            host, port = args.host, args.fallback_port
+
+        token = state.get("token")
+        send_token = token is not None and token not in used_tokens
+        if token is not None:
+            used_tokens.add(token)
+
+        start = time.time()
+        try:
+            run(host, port, device_info, token=token if send_token else None)
+            log.warning("classic avclient connection closed cleanly by peer")
+        except Exception as e:
+            log.warning("classic avclient connection ended: %r", e)
+        # Always pace reconnects; a clean close must not skip the sleep (rate
+        # limiter is 60 msgs/60s).
+        elapsed = time.time() - start
+        time.sleep(max(0.0, 5.0 - elapsed))
+
+
+if __name__ == "__main__":
+    main()
