@@ -49,3 +49,7 @@ adopt_state.json.tmp
 server.crt
 server.key
 run_all.log
+*.key
+*.pem
+*.crt
+.env
