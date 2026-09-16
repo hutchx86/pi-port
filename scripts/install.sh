@@ -103,7 +103,7 @@ case "$NAME" in *[!a-zA-Z0-9_-]*|"") die "invalid --name '$NAME' (letters/digits
 
 ARCH="$(uname -m)"
 if [ "$ARCH" != "aarch64" ] && [ "$NO_NPU" -eq 0 ]; then
-    die "this installer targets aarch64/RK3588, got $ARCH. On x86 use piport/x86/ (see its README); to force a CPU-only install here, pass --no-npu"
+    die "this installer targets aarch64/RK3588, got $ARCH. For the x86/no-NPU Docker variant see the 'experimental' branch; to force a CPU-only install here, pass --no-npu"
 fi
 
 log "installing system packages"

@@ -19,8 +19,8 @@ you supply your own console, cameras, and (for reverse engineering) firmware.
   detection, with real cameras paired and streamed concurrently.
 - A reference for the AI Port protocol, reverse-engineered from firmware on
   hardware the author owns and documented in `piport/README.md`.
-- A hobbyist/PoC project with an x86/no-NPU Docker variant for anyone without
-  Rockchip hardware.
+- A hobbyist/PoC project. An experimental x86/no-NPU Docker variant lives on
+  the `experimental` branch.
 
 ## What it is not
 
@@ -37,7 +37,7 @@ you supply your own console, cameras, and (for reverse engineering) firmware.
 
 | | Real AI Port | Pi Port |
 |---|---|---|
-| Hardware | Ubiquiti AI Port (Ambarella) | Orange Pi 5 Plus (RK3588), or x86 in Docker |
+| Hardware | Ubiquiti AI Port (Ambarella) | Orange Pi 5 Plus (RK3588) |
 | Firmware | Ubiquiti, signed | none; this repo's Python |
 | Detection model | Ubiquiti's own classifier | stock YOLOv5 (person/vehicle/animal) |
 | Output | full Ubiquiti product behaviour | the subset this project implements |
@@ -63,14 +63,14 @@ piport/            the emulator (RK3588 / Orange Pi)
   sysinfo_server.py  dev-box CPU/mem/GPU/NPU status page (+ webui.html)
   models/            anchors + COCO labels (model binaries fetched, not stored)
   instance_manager.py / run_all.py  multi-instance orchestration
-  x86/               x86/no-NPU Docker variant (onnxruntime on CPU)
 scripts/           install.sh (one-shot installer), fetch_models.py, helpers
 rknn_convert/      YOLOv5s -> RKNN conversion recipe (x86 build host)
 ```
 
 Model binaries (`.onnx`/`.rknn`) and all Ubiquiti firmware are **not** stored
 here; see *Model assets* below. `piport/README.md` has the protocol detail and
-per-component notes; `piport/x86/README.md` covers the Docker variant.
+per-component notes. The x86/no-NPU Docker variant lives on the `experimental`
+branch.
 
 ## Requirements
 
@@ -78,9 +78,6 @@ per-component notes; `piport/x86/README.md` covers the Docker variant.
   emulator binds UDP/10001 and TCP/443.
 - Python 3, and `rknn-toolkit-lite2` on the board for NPU inference.
 - A UniFi Protect console you own and control on the same LAN.
-
-The x86 variant needs Docker and runs `onnxruntime` on CPU instead of the NPU;
-no Rockchip hardware required.
 
 ## Install (RK3588 / Orange Pi)
 
@@ -179,20 +176,12 @@ instances.
 
 ### x86 / Docker variant
 
+The x86/no-NPU Docker variant is not part of `main`; it is maintained on the
+`experimental` branch (`piport/x86/`, onnxruntime on CPU). Check it out with:
+
 ```bash
-cd piport/x86
-python3 ../../scripts/fetch_models.py       # -> x86/models/yolov5n.onnx
-./run-smoke-test.sh                          # fetch + build + start + verify
-
-# manual equivalent:
-docker build -t piport-x86 .
-docker run --rm --cap-add=NET_ADMIN --network host piport-x86
+git switch experimental
 ```
-
-Only `detector.py` (onnxruntime on CPU) and `requirements.txt` differ from the
-RK3588 tree. `docker-compose.yml` is the single-instance host-network test;
-`docker-compose.macvlan.yml` is a multi-instance sketch (macvlan, not the
-default bridge, which breaks L2 discovery). See `piport/x86/README.md`.
 
 ### Operational notes
 
@@ -209,13 +198,13 @@ reproducible, they are not committed; `scripts/fetch_models.py` downloads them:
 
 | Asset | Used by | Source |
 |---|---|---|
-| `yolov5n.onnx` (3.8 MiB) | x86/CPU variant | Ultralytics release: <https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx> |
 | `yolov5s_relu.onnx` (27.6 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
-| anchors, COCO labels, bus.jpg, calibration subset | both | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
+| anchors, COCO labels, bus.jpg, calibration subset | RKNN conversion | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
 
-The x86 variant defaults to `yolov5n.onnx`; it still accepts the Rockchip
+The experimental x86 variant additionally uses Ultralytics `yolov5n.onnx`
+(AGPL-3.0, same as the weights) and still accepts the Rockchip
 `yolov5s_relu.onnx` via `AIPORT_MODEL_PATH` (both output layouts are
-auto-detected). The Ultralytics model is AGPL-3.0, same as the weights.
+auto-detected); see that branch's README.
 
 `yolov5s_relu.rknn` is produced on an x86_64 machine with `rknn-toolkit2`
 (install from PyPI or the Rockchip GitHub release -- see

@@ -1,7 +1,0 @@
-websockets>=12.0
-requests>=2.31
-numpy
-onnxruntime>=1.17
-
-# Runtime scripts don't use paramiko/grpcio/protobuf, so they are omitted.
-# For a GPU: swap in onnxruntime-gpu and add CUDAExecutionProvider in detector.py.
