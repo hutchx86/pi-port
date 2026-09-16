@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Shared configuration + device identity for the AI Port emulator.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
+"""Shared config + device identity for the AI Port emulator.
 
-Single source of truth read from ``aiport.cfg`` (INI); CLI flags still win
-over cfg values. Defaults to ``<project root>/aiport.cfg``.
+Single source of truth read from ``aiport.cfg`` (INI); CLI flags win over cfg
+values. Defaults to ``<project root>/aiport.cfg``.
 """
 import argparse
 import configparser
@@ -16,10 +18,10 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(HERE, "aiport.cfg")
 
-# Real Ubiquiti OUI; a non-Ubiquiti OUI can make the controller report "Unknown".
+# Real Ubiquiti OUI; a non-Ubiquiti one makes the controller report "Unknown".
 UBNT_OUI = "FCECDA"
 
-# Built-in defaults for any key the cfg file doesn't set.
+# Defaults for any key the cfg file doesn't set.
 DEFAULTS = {
     # [identity]
     "mac": "",
@@ -48,8 +50,7 @@ DEFAULTS = {
 
 
 def load_config(path=None):
-    """Parse aiport.cfg into merged settings; cfg wins over DEFAULTS, and a
-    missing file silently falls back to DEFAULTS."""
+    """Parse aiport.cfg into merged settings; a missing file falls back to DEFAULTS."""
     cfg = dict(DEFAULTS)
     path = path or DEFAULT_CONFIG_PATH
     parser = configparser.ConfigParser(interpolation=None)
@@ -82,9 +83,8 @@ def add_common_flags(ap):
 
 
 def load_config_and_logging(argv=None):
-    """Pre-parse --config/--debug (position-independent), load the cfg and
-    apply the debug log level; callers must also declare both via
-    add_common_flags()."""
+    """Pre-parse --config/--debug (position-independent), load cfg and apply the
+    debug log level; callers must also declare both via add_common_flags()."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=None)
     pre.add_argument("--debug", action="store_true", default=None)
@@ -104,13 +104,13 @@ def _iface_mac(iface):
 
 
 def _default_iface():
-    """Best-effort auto-detect: the interface carrying the default route,
-    else the first non-loopback interface that is up. Returns "" if unknown."""
+    """Best-effort auto-detect: the default-route interface, else the first
+    non-loopback up interface. Returns "" if unknown."""
     try:
         with open("/proc/net/route") as f:
             for line in f.readlines()[1:]:
                 fields = line.split()
-                # dest 0.0.0.0 with RTF_UP set (0x1) -- the default-route device
+                # dest 0.0.0.0 with RTF_UP (0x1) = the default-route device
                 if len(fields) >= 4 and fields[1] == "00000000" and int(fields[3], 16) & 0x1:
                     return fields[0]
     except (OSError, ValueError):
@@ -198,8 +198,7 @@ def netmask_to_prefix(netmask):
 
 
 def atomic_write_json(path, obj):
-    """Write obj as JSON atomically (tmp + os.replace) so concurrent readers
-    never see a torn write."""
+    """Write obj as JSON atomically (tmp + os.replace) so readers never see a torn write."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f)
@@ -216,8 +215,8 @@ def _tmpfs_base():
 
 
 def stream_dir(state_dir=None):
-    """RAM-only dir for the transient per-stream snapshot JPEGs; never on the
-    persistent root fs. --state-dir maps to a hash of its absolute path."""
+    """RAM-only dir for transient per-stream snapshot JPEGs; never persistent.
+    --state-dir maps to a hash of its absolute path."""
     base = _tmpfs_base()
     if state_dir:
         key = hashlib.sha1(os.path.abspath(state_dir).encode()).hexdigest()[:12]

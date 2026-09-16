@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Unit tests for config.py's pure logic (no hardware, no network)."""
 import os
 import sys

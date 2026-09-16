@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Runs the discovery + adopt-HTTP + ucp4-client + classic-avclient stages
 together. Needs root (binds :10001, :443). Settings come from aiport.cfg;
 per-instance overrides are passed through to every stage.

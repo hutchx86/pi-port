@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Unit tests for avclient.py's pure logic: geometry, zone/line
 parsing + crossing, snapshots. No sockets/device; ffmpeg tests skipped if absent.
 """

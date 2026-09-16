@@ -1,7 +1,7 @@
-# Single-instance smoke test with host networking: the L2 discovery beacon
-# (:10001/udp) and control API (:443) land on the real LAN, and run_all.py
-# auto-detects the host's route interface. For multiple instances or a distinct
-# IP, use docker-compose.macvlan.yml.
+# Single-instance host-network smoke test: the L2 discovery beacon (:10001/udp)
+# and control API (:443) land on the real LAN, and run_all.py auto-detects the
+# host's route interface. For multiple instances or a distinct IP, use
+# docker-compose.macvlan.yml.
 #
 #   python3 ../../scripts/fetch_models.py
 #   docker compose up --build

@@ -3,7 +3,5 @@ requests>=2.31
 numpy
 onnxruntime>=1.17
 
-# paramiko/grpcio/protobuf are unused by the runtime scripts, so omitted.
-#
-# For a GPU: swap onnxruntime for onnxruntime-gpu and add
-# "CUDAExecutionProvider" in detector.py.
+# Runtime scripts don't use paramiko/grpcio/protobuf, so they are omitted.
+# For a GPU: swap in onnxruntime-gpu and add CUDAExecutionProvider in detector.py.

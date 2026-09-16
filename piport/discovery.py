@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""UBNT L2 discovery-protocol responder (UDP/10001) for the AI Port emulator.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
+"""UBNT L2 discovery responder (UDP/10001) for the AI Port emulator.
 
 Classic UBNT discovery wire format. Sysid 0xa5f1 must map to catalog model
 "UVC AI Port" in the platform TLV. The controller scans multicast
@@ -24,7 +26,7 @@ ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
 log = logging.getLogger("aiport-discovery-beacon")
 
 DISCOVERY_PORT = 10001
-# The controller's adopt-candidate scan destination (not a broadcast frame).
+# The controller's adopt-candidate scan destination (not broadcast).
 MCAST_GROUP = "233.89.188.1"
 
 TLV_HW_ADDR = 0x01

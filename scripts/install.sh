@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 #
 # One-shot installer for the Pi Port AI-Port emulator on an Orange Pi 5 Plus
 # (RK3588 / aarch64). Does, in order:
@@ -14,7 +16,7 @@
 # Run as root (it installs packages, writes /etc/systemd/system and creates a
 # network interface):
 #
-#   sudo scripts/install.sh --console <UNVR-IP> [--parent-iface enP4p65s0]
+#   sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
 #
 # Options:
 #   --name NAME            instance name (default: main)
@@ -104,18 +106,12 @@ if [ "$ARCH" != "aarch64" ] && [ "$NO_NPU" -eq 0 ]; then
     die "this installer targets aarch64/RK3588, got $ARCH. On x86 use piport/x86/ (see its README); to force a CPU-only install here, pass --no-npu"
 fi
 
-# ---------------------------------------------------------------------------
-# 1. system packages
-# ---------------------------------------------------------------------------
 log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
     python3-venv python3-pip ffmpeg isc-dhcp-client iproute2 curl ca-certificates diffutils git
 
-# ---------------------------------------------------------------------------
-# 2. python venv + dependencies
-# ---------------------------------------------------------------------------
 if [ ! -x "$PY" ]; then
     log "creating venv at $VENV"
     python3 -m venv "$VENV"
@@ -128,9 +124,6 @@ if [ "$NO_NPU" -eq 0 ]; then
     "$PY" -m pip install --quiet rknn-toolkit-lite2
 fi
 
-# ---------------------------------------------------------------------------
-# 3. model assets
-# ---------------------------------------------------------------------------
 log "fetching model assets (ONNX + labels/anchors; binaries are gitignored)"
 "$PY" "$REPO_ROOT/scripts/fetch_models.py"
 
@@ -231,9 +224,7 @@ EOF
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# 4. system librknnrt.so (must match rknn-toolkit2 2.3.2; stock OS is too old)
-# ---------------------------------------------------------------------------
+# librknnrt.so must match rknn-toolkit2 2.3.2; the stock OS version is too old.
 if [ "$NO_NPU" -eq 0 ]; then
     lib="$(ldconfig -p 2>/dev/null | awk '/librknnrt\.so/{print $NF; exit}' || true)"
     lib="${lib:-/usr/lib/librknnrt.so}"
@@ -258,9 +249,6 @@ if [ "$NO_NPU" -eq 0 ]; then
     rm -f "$tmp"
 fi
 
-# ---------------------------------------------------------------------------
-# 5. configuration
-# ---------------------------------------------------------------------------
 set_ini() {  # set_ini <section> <key> <value> <file>
     local section="$1" key="$2" value="$3" file="$4" tmp
     tmp="$(mktemp)"
@@ -296,9 +284,6 @@ if [ -z "$cfg_host" ]; then
     die "no console host configured; pass --console <UNVR-IP> or set [console] host in $CFG"
 fi
 
-# ---------------------------------------------------------------------------
-# 6. emulator instance (systemd, via instance_manager.py) + web UI unit
-# ---------------------------------------------------------------------------
 INSTANCE_UNIT="$SYSTEMD_DIR/aiport-instance-${NAME}.service"
 INSTANCE_IFACE="ap-${NAME}"
 INSTANCE_IFACE="${INSTANCE_IFACE:0:15}"
@@ -348,9 +333,6 @@ systemctl daemon-reload
 systemctl enable --now piport-webui.service
 systemctl restart piport-webui.service
 
-# ---------------------------------------------------------------------------
-# 7. report
-# ---------------------------------------------------------------------------
 box_ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
 sleep 1
 if curl -fsS "http://127.0.0.1:${WEBUI_PORT}/api/stats" >/dev/null 2>&1; then

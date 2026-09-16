@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Unit tests for detector.py's pure post-processing; skipped if numpy/
 rknnlite aren't importable so the suite still runs off-device.
 """

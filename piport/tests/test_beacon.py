@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Unit tests for discovery.py's discovery response builder (no sockets)."""
 import os
 import socket

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Outbound mTLS WebSocket ("ucp4") client for the AI Port emulator.
 
 8-byte header + JSON envelope; AI Port uses the real camera ubnt_avclient
@@ -140,8 +142,7 @@ def _watch_for_reconnect(ws, this_connection_token, stop_event, poll_interval=2.
     while not stop_event.is_set():
         time.sleep(poll_interval)
         current = _read_current_token()
-        # Any token change (including clearing) makes this connection's
-        # X-Adopted stale, so tear it down.
+        # Any token change (including clearing) makes X-Adopted stale, so tear down.
         if current != this_connection_token:
             log.info("adopt token changed (%s -> %s) -- closing this connection "
                       "to force a fresh one", this_connection_token, current)

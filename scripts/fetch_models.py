@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Fetch YOLOv5s model assets this project uses, and optionally convert to RKNN.
 
 Downloads the open Rockchip YOLOv5s model (ONNX + anchors + COCO labels +
@@ -19,9 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZOO = "https://raw.githubusercontent.com/airockchip/rknn_model_zoo/v2.3.2"
 ONNX_URL = ("https://ftrg.zbox.filez.com/v2/delivery/data/"
             "95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx")
-# Small CPU model for the x86 variant: the official Ultralytics YOLOv5n ONNX
-# export (decode baked in -> one [1,N,85] output). ~3.8 MiB vs the Rockchip
-# yolov5s export's ~28.9 MiB, and materially faster on CPU.
+# Small CPU model for the x86 variant: official Ultralytics YOLOv5n ONNX (decode
+# baked in -> one [1,N,85] output). ~3.8 MiB vs Rockchip yolov5s's ~28.9 MiB, faster on CPU.
 YOLOV5N_URL = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx"
 YOLOV5N_SHA256 = "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"
 UA = {"User-Agent": "piport-fetch-models"}
@@ -79,7 +80,7 @@ def main():
             download(url, os.path.join(DIRS[t], name), args.force)
 
     # Rockchip yolov5s_relu ONNX: only the .rknn conversion workspace needs it
-    # now (the x86 variant uses the smaller Ultralytics yolov5n below).
+    # (x86 uses the smaller yolov5n below).
     download(ONNX_URL, os.path.join(DIRS["rknn_convert"], "yolov5s_relu.onnx"), args.force)
 
     # Small CPU model for the x86 variant (gitignored binary, sha256-pinned).

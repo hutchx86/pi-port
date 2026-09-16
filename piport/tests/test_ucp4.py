@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Unit tests for ucp4_client.py's wire framing (pack/unpack records)."""
 import json
 import os

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 #
 # Build the x86 image and run a no-hardware smoke test on an x86_64 host:
-# fetch the model, docker build, start on host networking, and verify that all
-# four components are actually alive (run_all.py blocks on the first child, so
-# "container still running" alone proves little). Needs Docker (root or a user
-# in the docker group). This broadcasts discovery on the host's LAN, so run it
-# on a network you control.
+# fetch the model, docker build, start on host networking, then check all four
+# components are alive (run_all.py blocks on its first child, so "container
+# running" alone proves little). Needs Docker. Broadcasts discovery on the
+# host's LAN -- run it only on a network you control.
 #
 #   ./run-smoke-test.sh
 #

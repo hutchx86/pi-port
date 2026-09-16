@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Real object detection on the RK3588 NPU.
 
 Model: YOLOv5s (ReLU) INT8, converted from Rockchip's rknn_model_zoo v2.3.2
@@ -154,7 +156,7 @@ def _post_process(outputs, anchors):
 
 class Detector:
     """One shared RKNNLite behind a lock -- the NPU serializes inference
-    anyway, so this is as fast as one instance per camera."""
+    anyway, so it's as fast as one instance per camera."""
 
     def __init__(self):
         if RKNNLite is None:

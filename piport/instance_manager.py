@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Runs multiple independent AI Port emulator instances, each as its own
 systemd unit that survives reboot and keeps a fixed identity (MAC/device-id,
 generated once at creation).
@@ -124,8 +126,8 @@ def _build_unit(entry):
     post_lines = []
     if entry["mode"] == "macvlan":
         iface, parent, mac_colons = entry["iface"], entry["parent_iface"], entry["mac_display"]
-        # '-' prefix tolerates nonzero exit: cleanup "fails" on a normal first
-        # start, only doing real work after a crash left the interface behind.
+        # '-' prefix tolerates nonzero exit: cleanup only does real work after a crash
+        # left the interface behind (a normal first start has nothing to delete).
         pre_lines = [
             f"ExecStartPre=-/sbin/ip link del {iface}",
             f"ExecStartPre=/sbin/ip link add link {parent} name {iface} "

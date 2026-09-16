@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """HTTPS control API on :443, standing in for AI Port's local ubnt_ctlserver:
 GET/POST /api/info, POST /api/1.2/manage (adopt), plus login/status/snapshot.
 The controller does not validate the server cert.
@@ -21,8 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CERT_PATH = os.path.join(HERE, "server.crt")
 KEY_PATH = os.path.join(HERE, "server.key")
 ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
-# RAM-only stream dir shared with avclient.py (writes snapshots; this serves
-# them from /api/1.2/snapshot).
+# RAM-only dir shared with avclient.py (writes snapshots); served from /api/1.2/snapshot.
 STREAM_DIR = config.stream_dir()
 
 
@@ -40,8 +41,7 @@ def ensure_cert():
 
 
 def _is_adopted() -> bool:
-    # Read adopt state live (avclient.py clears it on ResetToDefaults), so
-    # isAdopted follows a real un-adopt.
+    # Read live (avclient.py clears it on ResetToDefaults) so isAdopted follows a real un-adopt.
     try:
         with open(ADOPT_STATE_FILE) as f:
             state = json.load(f)
@@ -98,17 +98,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.rstrip("/") in ("/api/1.2/status",):
             self._serve_status()
         elif self.path.rstrip("/") in ("/api/1.2/snapshot",):
-            # The direct REST snapshot pull is a GET, separate from the POST
-            # /api/1.2/snapshot flow; same image/handler.
+            # REST snapshot pull (GET) is separate from POST /api/1.2/snapshot; same handler.
             self._serve_snapshot()
         else:
             log.warning("unhandled GET path %s -- replying 200 anyway", self.path)
             self._json(200, {"statusCode": 200})
 
     def _serve_status(self):
-        # Camera capability endpoint (getFeatureFlags/requestFeatureFlags):
-        # {fw, board, features}; capabilities kept honest to what the detector
-        # supports (person/vehicle/animal + motion).
+        # Camera capability endpoint (getFeatureFlags/requestFeatureFlags); kept
+        # honest to the detector (person/vehicle/animal + motion).
         cfg = self.server.aiport_config
         mac_colons = ":".join(cfg["mac"][i:i + 2] for i in range(0, 12, 2))
         self._json(200, {
@@ -138,16 +136,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._persist_adopt(mgmt_payload)
             self._json(200, {"statusCode": 200})
         elif path in ("/api/1.2/manage",):
-            # Real AI Port adopt endpoint (classic UVC management API; /api/
-            # adopt unused); adopt fields nested under "mgmt".
+            # Real adopt endpoint (classic UVC management API; /api/adopt unused);
+            # adopt fields nested under "mgmt".
             mgmt_payload = payload.get("mgmt", payload)
             self._persist_adopt(mgmt_payload)
             self._json(200, {"statusCode": 200})
         elif path in ("/api/readopt", "/readopt"):
             self._json(200, {"statusCode": 200})
         elif path in ("/api/1.2/login",):
-            # Controller logs in first and replays the Set-Cookie; no real
-            # auth, so any value is accepted.
+            # Controller logs in first and replays the Set-Cookie; no real auth.
             self.send_response(200)
             self.send_header("Set-Cookie", "AIROS_SESSIONID=piport-session; Path=/")
             body = json.dumps({"statusCode": 200}).encode()
@@ -156,8 +153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path in ("/api/1.2/snapshot",):
-            # Serve the latest frame avclient.py's ffmpeg wrote to
-            # STREAM_DIR (RAM-only handoff); 404 if nothing streamed yet.
+            # Serve the latest frame avclient.py's ffmpeg wrote to STREAM_DIR; 404 if none yet.
             self._serve_snapshot()
         else:
             log.warning("unhandled POST path %s -- replying 200 anyway", self.path)

@@ -1,17 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 hutchx86
 """Object detection on generic x86 CPU (no NPU).
 
-Runs an ONNX model directly via onnxruntime. Two output layouts are supported
-and auto-detected, so either model works:
+Runs an ONNX model via onnxruntime (CPUExecutionProvider). Two output
+layouts are auto-detected so either model works:
 
-  * Ultralytics YOLOv5 ONNX export (default: models/yolov5n.onnx) -- a single
-    ``[1, N, 5+num_classes]`` output with box decode (xywh, pixels) and
-    sigmoid already baked into the graph.
-  * Rockchip yolov5s_relu.onnx -- three raw ``[1,255,H,W]`` heads that need the
+  * Ultralytics YOLOv5 ONNX export (default models/yolov5n.onnx): one
+    ``[1, N, 5+num_classes]`` output, box decode + sigmoid already baked in.
+  * Rockchip yolov5s_relu.onnx: three raw ``[1,255,H,W]`` heads needing the
     anchor/grid decode (same math as the RK3588 variant).
 
 Override the model with AIPORT_MODEL_PATH. Labels/anchors, the COCO->AI-Port
-type mapping and the box/NMS math are kept identical to the RK3588 variant so
-avclient.py needs no changes.
+type mapping and the box/NMS math match the RK3588 variant, so avclient.py
+needs no changes.
 """
 import logging
 import os
@@ -61,8 +62,7 @@ def _load_labels():
 
 
 # --- Rockchip raw-head layout ([1,255,H,W] x3) -----------------------------
-# _box_process through _post_process are copied verbatim from the RK3588
-# detector.py; keep them unchanged for easy diffing.
+# _box_process.._post_process mirror the RK3588 detector.py; keep in sync.
 
 def _box_process(position, anchors):
     grid_h, grid_w = position.shape[2:4]
@@ -101,6 +101,8 @@ def _filter_boxes(boxes, box_confidences, box_class_probs):
 
 
 def _nms_boxes(boxes, scores):
+    # An earlier x86 copy dropped the +w/+h terms, so IoU was always 0 and no
+    # duplicate was suppressed; fixed to match ../detector.py.
     x = boxes[:, 0]
     y = boxes[:, 1]
     w = boxes[:, 2] - boxes[:, 0]
@@ -186,10 +188,8 @@ def _post_process_ultralytics(output):
 
 
 class Detector:
-    """One shared onnxruntime InferenceSession behind a lock.
-
-    Keeps detect(frame_rgb) -> result shape identical to the RK3588
-    variant so avclient.py needs no changes.
+    """One shared onnxruntime InferenceSession behind a lock; detect() output
+    matches the RK3588 variant so avclient.py needs no changes.
     """
 
     def __init__(self):
@@ -202,17 +202,15 @@ class Detector:
         self._lock = threading.Lock()
         self._labels = _load_labels()
         self._anchors = _load_anchors()
-        # CPU-only by design; use ["CUDAExecutionProvider",
-        # "CPUExecutionProvider"] if onnxruntime-gpu is swapped in.
+        # CPU-only; add "CUDAExecutionProvider" if using onnxruntime-gpu.
         self._session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
         inp = self._session.get_inputs()[0]
         self._input_name = inp.name
-        # Ultralytics' release ONNX is float16; honour whatever the graph wants.
+        # Ultralytics release ONNX is fp16; honour the graph's input dtype.
         self._in_dtype = np.float16 if "float16" in inp.type else np.float32
         outs = self._session.get_outputs()
         shapes = [o.shape for o in outs]
-        # One [1,N,5+classes] output => Ultralytics (decode baked in);
-        # otherwise the three Rockchip raw heads.
+        # Single [1,N,5+classes] output => Ultralytics; else raw heads.
         if len(outs) == 1 and len(shapes[0]) == 3 and shapes[0][-1] == 5 + len(self._labels):
             self._mode = "ultralytics"
         else:
@@ -221,11 +219,11 @@ class Detector:
                   MODEL_PATH, self._mode, shapes, self._session.get_providers())
 
     def detect(self, frame_rgb):
-        """frame_rgb: HxWx3 uint8 RGB, already resized to IMG_SIZE (plain
-        stretch, no letterboxing). Returns {"objectType", "score", "box":
-        (x1,y1,x2,y2)} in IMG_SIZE pixel space, sorted by score descending.
+        """frame_rgb: HxWx3 uint8 RGB, pre-resized to IMG_SIZE (plain stretch,
+        no letterbox). Returns {"objectType","score","box":(x1,y1,x2,y2)} in
+        IMG_SIZE pixels, score-descending.
         """
-        # NHWC uint8 -> NCHW float [1,3,H,W], normalized to [0,1].
+        # NHWC uint8 -> NCHW float [1,3,H,W], scaled to [0,1].
         chw = frame_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
         batched = chw[np.newaxis, ...].astype(self._in_dtype)
         with self._lock:
