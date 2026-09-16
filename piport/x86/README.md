@@ -6,7 +6,8 @@ with no NPU. This is an **addition**, not a replacement: `../` is still the
 real, live-deployed, Orange-Pi-hosted emulator, and nothing here affects it.
 
 This is an interoperability reimplementation, not the original Ubiquiti
-product; it is not affiliated with or endorsed by Ubiquiti.
+product; it is not affiliated with or endorsed by Ubiquiti. Licensed
+AGPL-3.0-or-later (see the repository root).
 
 ## What differs from the RK3588 variant
 

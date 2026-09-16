@@ -210,7 +210,7 @@ reproducible, they are not committed; `scripts/fetch_models.py` downloads them:
 | Asset | Used by | Source |
 |---|---|---|
 | `yolov5n.onnx` (3.8 MiB) | x86/CPU variant | Ultralytics release: <https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx> |
-| `yolov5s_relu.onnx` (28.9 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
+| `yolov5s_relu.onnx` (27.6 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
 | anchors, COCO labels, bus.jpg, calibration subset | both | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
 
 The x86 variant defaults to `yolov5n.onnx`; it still accepts the Rockchip

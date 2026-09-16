@@ -22,7 +22,7 @@ ZOO = "https://raw.githubusercontent.com/airockchip/rknn_model_zoo/v2.3.2"
 ONNX_URL = ("https://ftrg.zbox.filez.com/v2/delivery/data/"
             "95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx")
 # Small CPU model for the x86 variant: official Ultralytics YOLOv5n ONNX (decode
-# baked in -> one [1,N,85] output). ~3.8 MiB vs Rockchip yolov5s's ~28.9 MiB, faster on CPU.
+# baked in -> one [1,N,85] output). ~3.8 MiB vs Rockchip yolov5s's ~27.6 MiB, faster on CPU.
 YOLOV5N_URL = "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.onnx"
 YOLOV5N_SHA256 = "04f0e55c26f58d17145b36045780fe1250d5bd2187543e11568e5141d05b3262"
 UA = {"User-Agent": "piport-fetch-models"}

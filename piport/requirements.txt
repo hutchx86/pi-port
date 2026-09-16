@@ -1,13 +1,9 @@
 paramiko>=3.4
-grpcio>=1.60
-grpcio-tools>=1.60
-protobuf>=4.25
 websockets>=12.0
 requests>=2.31
 numpy
 
 # rknn-toolkit-lite2 is NOT listed here -- install it separately with:
 #   pip install rknn-toolkit-lite2
-# and see README.md's "Real object detection" section for the required
-# matching system librknnrt.so upgrade (the version bundled with this Pi's
-# stock OS image is too old to load models built by newer rknn-toolkit2).
+# See piport/README.md ("Object detection") for the required matching system
+# librknnrt.so upgrade (the stock OS version is too old for newer rknn-toolkit2).

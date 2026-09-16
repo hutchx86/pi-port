@@ -66,7 +66,7 @@ additions. All of the following was confirmed live against a real console.
 
 Identity, networking, and the console endpoint live in `aiport.cfg` (INI) next to `run_all.py`,
 loaded via `config.py`. Every stage reads the same file, and any CLI flag overrides the cfg
-value. Each script also accepts `--config <path>` and `--debug`; `run_all.py` passes both through
+value. The protocol scripts also accept `--config <path>` and `--debug`; `run_all.py` passes both through
 to its children. Only full-line `#` comments are supported (`configparser` ignores inline ones).
 
 ```ini
