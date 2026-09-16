@@ -280,6 +280,11 @@ must offer them the corresponding source.
 
 ## Credits
 
+Special thanks to
+[dciancu/unifi-protect-unvr-docker-arm64](https://github.com/dciancu/unifi-protect-unvr-docker-arm64)
+-- the inspiration for getting into UniFi tinkering in general, and whose
+methods in that repo helped me learn and understand how parts of it work.
+
 Protocol work was informed by the open-source UniFi community, including
 [rjmotion/pyunifiwire](https://github.com/rjmotion/pyunifiwire) discovery notes
 and
