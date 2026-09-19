@@ -325,5 +325,28 @@ class TestConfigHandler(Base):
         self.assertEqual(self.sent[-1][0], "ChangeSmartDetectSettings")
 
 
+class TestEventDedupe(Base):
+    def setUp(self):
+        super().setUp()
+        av._last_status_sent.clear()
+        av._feature_flags_sent.clear()
+
+    def test_status_event_sent_only_on_change(self):
+        av._send_status_event(None, "D", True, True, True, True)
+        av._send_status_event(None, "D", True, True, True, True)
+        self.assertEqual(len(self.sent), 1)
+        av._send_status_event(None, "D", True, False, True, True)  # stream stopped
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.sent[-1][0], "EventAIPortStatus")
+
+    def test_feature_flags_sent_once_per_connection(self):
+        av._send_feature_flags_event(None, "D")
+        av._send_feature_flags_event(None, "D")
+        self.assertEqual(len(self.sent), 1)
+        av._feature_flags_sent.clear()  # simulates the next controller connection
+        av._send_feature_flags_event(None, "D")
+        self.assertEqual(len(self.sent), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

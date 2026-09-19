@@ -872,20 +872,42 @@ def _send_line_detect_event(ws, device_id, line, edge_type, event_id, direction,
     send_msg(ws, "EventSmartDetect", payload, response_expected=False)
 
 
+# Per-connection dedupe of the idempotent capability/status events. Protect
+# re-applies smart-detect settings (to the paired camera too) on every
+# EventFeatureFlagsUpdated / EventAIPortStatus it receives; G3-class paired
+# cameras have no onboard detector and answer ChangeSmartDetectSettings with
+# "Service Unavailable", and statusUpdateSmartServices resets its applied-guard
+# on that failure -- so resending these events on every UiStreamControl /
+# reconnect turns one benign rejection into a retry loop. Emit on change only;
+# both are cleared when the controller connection is re-established.
+_last_status_sent = {}
+_feature_flags_sent = set()
+
+
 def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready):
     # Field names from the real ubnt_av_aiport string table; isSmartDetectReady gates AI-task dispatch.
+    state = (bool(plug), bool(streaming), bool(smart_ready), bool(audio_ready))
+    if _last_status_sent.get(device_id) == state:
+        log.info("EventAIPortStatus unchanged for deviceID=%s %s -- not resending",
+                  device_id, state)
+        return
+    _last_status_sent[device_id] = state
     send_msg(ws, "EventAIPortStatus", {
         "deviceID": device_id,
-        "isPlug": plug,
-        "isStreaming": streaming,
-        "isSmartDetectReady": smart_ready,
-        "isAudioEventReady": audio_ready,
+        "isPlug": state[0],
+        "isStreaming": state[1],
+        "isSmartDetectReady": state[2],
+        "isAudioEventReady": state[3],
     }, response_expected=False)
 
 
 def _send_feature_flags_event(ws, device_id):
     # Capability declaration; honest to the detector's RKNN classes (person/vehicle/animal).
-    # lineCrossingCounting is off (not implemented).
+    # lineCrossingCounting is off (not implemented). Constant per pairing -> send once
+    # per controller connection (re-sending only re-triggers Protect's settings push).
+    if device_id in _feature_flags_sent:
+        return
+    _feature_flags_sent.add(device_id)
     send_msg(ws, "EventFeatureFlagsUpdated", {
         "deviceID": device_id,
         "smartDetect": ["person", "vehicle", "animal"],
@@ -1054,6 +1076,10 @@ def run(host, port, device_info, token=None):
     # IP made Protect tell us to upload snapshots to ourselves on :7444, which
     # nothing listens on, so paired cameras had no live/overview thumbnail.
     device_info = {**device_info, "console_host": host}
+    # New controller connection = fresh state: forget what this session already
+    # reported so the controller gets one full status/capability snapshot.
+    _last_status_sent.clear()
+    _feature_flags_sent.clear()
     url = f"wss://{host}:{port}/camera/1.0/ws"
     if token:
         url += f"?token={token}"
