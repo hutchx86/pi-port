@@ -181,7 +181,8 @@ def handle_action(head, body, device_info):
             "guid": device_info["guid"],
             "deviceId": device_info["device_id"],
             "ip": device_info["ip"],
-            "connectionHost": device_info["ip"],
+            # The controller's host, not ours (used to build upload URLs).
+            "connectionHost": device_info.get("console_host") or device_info["ip"],
             "connectionSecurePort": 443,
             "uptime": (now_ms - _PROCESS_START_MS) // 1000,
             "upSince": _PROCESS_START_MS,

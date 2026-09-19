@@ -115,7 +115,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "anonymousDeviceId": cfg["device_id"],
             "ip": cfg["ip"],
             "uptime": 0,
-            "connectionHost": cfg["ip"],
+            # The controller's host, not ours (Protect builds upload URLs from it).
+            "connectionHost": cfg.get("console_host") or cfg["ip"],
             # Real hwrev unconfirmed; placeholder matching ucp4 getInfo's hwrev.
             "hardwareRevision": 1,
         }
@@ -287,6 +288,7 @@ def main():
         "device_id": args.device_id,
         "guid": args.guid,
         "ip": ip,
+        "console_host": cfg["host"],
         "last_adopt_payload": None,
     }
 

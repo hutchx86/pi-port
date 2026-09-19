@@ -1047,6 +1047,13 @@ def _adopt_token():
 
 
 def run(host, port, device_info, token=None):
+    # `connectionHost` is the controller this device is connected to (NOT the
+    # device's own IP): Protect builds camera-upload URLs from it
+    # (`api.getCameraUploadPathAndToken`: `https://${camera.connectionHost ||
+    # nvr.host}:<cameraHttps>/internal/camera-upload/<token>`). Reporting our own
+    # IP made Protect tell us to upload snapshots to ourselves on :7444, which
+    # nothing listens on, so paired cameras had no live/overview thumbnail.
+    device_info = {**device_info, "console_host": host}
     url = f"wss://{host}:{port}/camera/1.0/ws"
     if token:
         url += f"?token={token}"
@@ -1073,7 +1080,7 @@ def run(host, port, device_info, token=None):
             "model": device_info["type"],
             "name": device_info.get("hostname", "piport"),
             "fwVersion": device_info["version"],
-            "connectionHost": device_info["ip"],
+            "connectionHost": device_info.get("console_host") or device_info["ip"],
             "connectionSecurePort": port,
             "protocolVersion": 67,
             "adoptionCode": _adopt_token(),
