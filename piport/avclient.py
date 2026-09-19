@@ -903,17 +903,18 @@ def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready)
 
 def _send_feature_flags_event(ws, device_id):
     # Capability declaration; honest to the detector's RKNN classes (person/vehicle/animal).
-    # lineCrossingCounting is off (not implemented). Constant per pairing -> send once
+    # Line Crossing is declared *inside* `smartDetect` -- controller-side
+    # `deserializeFromCamera` sets hasLineCrossing = smartDetect.includes("lineCrossing"),
+    # a top-level `lineCrossing` key is ignored. lineCrossingCounting stays off
+    # (not implemented), so it is not included. Constant per pairing -> send once
     # per controller connection (re-sending only re-triggers Protect's settings push).
     if device_id in _feature_flags_sent:
         return
     _feature_flags_sent.add(device_id)
     send_msg(ws, "EventFeatureFlagsUpdated", {
         "deviceID": device_id,
-        "smartDetect": ["person", "vehicle", "animal"],
+        "smartDetect": ["person", "vehicle", "animal", "lineCrossing"],
         "motionDetect": ["stable"],
-        "lineCrossing": True,
-        "lineCrossingCounting": False,
         "mic": True,
         "speaker": True,
         "ledStatus": True,
@@ -1119,7 +1120,7 @@ def run(host, port, device_info, token=None):
             "totalLoad": 0.1,
             "uptime": (now_ms - _PROCESS_START_MS) // 1000,
             "features": {
-                "smartDetect": ["person", "vehicle", "animal"],
+                "smartDetect": ["person", "vehicle", "animal", "lineCrossing"],
                 "motionDetect": ["stable"],
                 "mic": True,
                 "speaker": True,
