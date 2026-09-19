@@ -147,7 +147,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "fw": cfg["fw_version"],
             "board": {"hwaddr": mac_colons},
             "features": {
-                "smartDetect": ["person", "vehicle", "animal", "lineCrossing"],
+                "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
                 "motionDetect": ["stable"],
                 "mic": True,
                 "speaker": True,

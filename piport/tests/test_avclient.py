@@ -348,5 +348,22 @@ class TestEventDedupe(Base):
         self.assertEqual(len(self.sent), 2)
 
 
+class TestStreamClocks(Base):
+    def test_stream_clocks_zero_before_start(self):
+        self.assertEqual(av._stream_clocks("nope"), (0, 0))
+
+    def test_stream_clocks_advance_after_start(self):
+        av._stream_started_monotonic_ms["D"] = int(time.monotonic() * 1000) - 1500
+        mono, stream = av._stream_clocks("D")
+        self.assertGreaterEqual(mono, 1400)
+        self.assertEqual(mono, stream)  # same timebase, like a real camera
+
+    def test_stop_stream_clears_clock_origin(self):
+        av._active_streams["D"] = None
+        av._stream_started_monotonic_ms["D"] = int(time.monotonic() * 1000)
+        av._stop_stream("D")
+        self.assertNotIn("D", av._stream_started_monotonic_ms)
+
+
 if __name__ == "__main__":
     unittest.main()

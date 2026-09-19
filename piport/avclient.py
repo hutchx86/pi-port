@@ -50,6 +50,9 @@ _active_streams = {}
 _STREAM_DIR = config.stream_dir()
 # deviceID -> consecutive unexpected-death count since the last UiStreamControl start.
 _stream_restart_count = {}
+# deviceID -> time.monotonic()*1000 when its RTSP pull started; the origin for
+# clockMonotonic/clockStream on that device's EventSmartDetect payloads.
+_stream_started_monotonic_ms = {}
 
 # Prefer ffmpeg-rockchip (H.264 via RKVDEC; mainline rkmpp wedges when MPP's queue
 # fills); fall back to system ffmpeg.
@@ -151,6 +154,7 @@ def _stop_stream(device_id):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+    _stream_started_monotonic_ms.pop(device_id, None)
     with _frame_lock:
         _latest_frame.pop(device_id, None)
 
@@ -181,6 +185,8 @@ def _start_stream(device_id, ip, port, uri, width=None, height=None):
     log.info("starting merged RTSP pull for deviceID=%s: %s", device_id, url)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _active_streams[device_id] = proc
+    # Origin for this device's clockMonotonic/clockStream (ms since the pull began).
+    _stream_started_monotonic_ms[device_id] = int(time.monotonic() * 1000)
     frame_bytes = size * size * 3
 
     def _reader():
@@ -695,11 +701,28 @@ def _upload_snapshot(upload_uri, device_info, requested_filename, what=None,
         log.warning("snapshot upload to %s failed: %r", upload_uri, e)
 
 
+def _stream_clocks(device_id):
+    """(clockMonotonic, clockStream) in ms for a device: the device's monotonic
+    clock (ms since this process started the stream) and the media-timeline
+    position. Real cameras report the two within tens of ms of each other
+    (confirmed from a native camera's EventSmartDetect: clockStream 69938862 vs
+    clockMonotonic 69964728, rate 1000 = ms). The console joins tracks to the
+    media timeline with these, so zeros -- what we used to send -- leave the
+    console unable to place a track (no live overlay).
+    """
+    started = _stream_started_monotonic_ms.get(device_id)
+    if started is None:
+        return 0, 0
+    mono = int(time.monotonic() * 1000) - started
+    return mono, mono
+
+
 def _send_smart_detect_event(ws, device_id, edge_type="none", event_id=1, stationary=False,
                               object_type="person", coord=None, confidence=95,
                               first_shown_ms=None, tracker_id=1):
     # Real EventSmartDetect shape; deviceID is our addition (required by AI-Port event routing).
     now_ms = int(time.time() * 1000)
+    clock_mono, clock_stream = _stream_clocks(device_id)
     # Placeholder box is only a fallback; tracks open on real detections.
     real_coord = [int(round(v)) for v in coord] if coord is not None else [100, 100, 200, 200]
     # firstShownTimeMs must stay at the track's first-seen time (recomputing looks like a new track).
@@ -710,8 +733,8 @@ def _send_smart_detect_event(ws, device_id, edge_type="none", event_id=1, statio
     zone_level = 0 if edge_type == "none" else confidence_level
     payload = {
         "deviceID": device_id,
-        "clockMonotonic": 0,
-        "clockStream": 0,
+        "clockMonotonic": clock_mono,
+        "clockStream": clock_stream,
         "clockStreamRate": 1000,
         "clockWall": now_ms,
         "descriptors": [{
@@ -787,6 +810,7 @@ def _send_line_detect_event(ws, device_id, line, edge_type, event_id, direction,
     """Line Crossing event: same envelope as the zone path but with
     linesStatus, so the controller selects smartDetectLine."""
     now_ms = int(time.time() * 1000)
+    clock_mono, clock_stream = _stream_clocks(device_id)
     real_coord = [int(round(v)) for v in coord] if coord is not None else [100, 100, 200, 200]
     first_shown = first_shown_ms if first_shown_ms is not None else now_ms
     confidence_level = int(round(confidence * 100)) if confidence <= 1 else int(round(confidence))
@@ -796,8 +820,8 @@ def _send_line_detect_event(ws, device_id, line, edge_type, event_id, direction,
     zone_level = 0 if edge_type == "none" else confidence_level
     payload = {
         "deviceID": device_id,
-        "clockMonotonic": 0,
-        "clockStream": 0,
+        "clockMonotonic": clock_mono,
+        "clockStream": clock_stream,
         "clockStreamRate": 1000,
         "clockWall": now_ms,
         "descriptors": [{
@@ -903,17 +927,22 @@ def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready)
 
 def _send_feature_flags_event(ws, device_id):
     # Capability declaration; honest to the detector's RKNN classes (person/vehicle/animal).
-    # Line Crossing is declared *inside* `smartDetect` -- controller-side
-    # `deserializeFromCamera` sets hasLineCrossing = smartDetect.includes("lineCrossing"),
-    # a top-level `lineCrossing` key is ignored. lineCrossingCounting stays off
-    # (not implemented), so it is not included. Constant per pairing -> send once
-    # per controller connection (re-sending only re-triggers Protect's settings push).
+    # Several UI features are derived by the controller's `deserializeFromCamera` from
+    # THIS array, not from top-level keys:
+    #   hasLineCrossing       = smartDetect.includes("lineCrossing")
+    #   hasLiveviewTracking   = smartDetect.includes("liveviewTracking")
+    # hasLiveviewTracking is what the web UI's live-view object-overlay ("Highlight
+    # Detected Motion" / "Object Overlay" / "Highlight Camera Motion") gates on: the app
+    # filters the stored overlay selection through the camera capability, so without it
+    # the toggle silently resyncs back to off. lineCrossingCounting stays off (not
+    # implemented), so it is not included. Constant per pairing -> send once per
+    # controller connection (re-sending only re-triggers Protect's settings push).
     if device_id in _feature_flags_sent:
         return
     _feature_flags_sent.add(device_id)
     send_msg(ws, "EventFeatureFlagsUpdated", {
         "deviceID": device_id,
-        "smartDetect": ["person", "vehicle", "animal", "lineCrossing"],
+        "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
         "motionDetect": ["stable"],
         "mic": True,
         "speaker": True,
@@ -1120,7 +1149,7 @@ def run(host, port, device_info, token=None):
             "totalLoad": 0.1,
             "uptime": (now_ms - _PROCESS_START_MS) // 1000,
             "features": {
-                "smartDetect": ["person", "vehicle", "animal", "lineCrossing"],
+                "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
                 "motionDetect": ["stable"],
                 "mic": True,
                 "speaker": True,
