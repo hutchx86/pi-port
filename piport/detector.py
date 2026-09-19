@@ -26,7 +26,10 @@ LABELS_PATH = os.path.join(MODELS_DIR, "coco_80_labels_list.txt")
 ANCHORS_PATH = os.path.join(MODELS_DIR, "anchors_yolov5.txt")
 
 IMG_SIZE = (640, 640)  # (width, height) -- matches the model's fixed input
-OBJ_THRESH = 0.35
+# Objectness x class-confidence gate. Raised from 0.35: at night a daylight-COCO
+# INT8 model's false "person" hits cluster at 0.36-0.48, so 0.35 opened events on
+# empty scenes. Override with AIPORT_OBJ_THRESH for field tuning without a rebuild.
+OBJ_THRESH = float(os.environ.get("AIPORT_OBJ_THRESH", "0.5"))
 NMS_THRESH = 0.45
 
 # AI Port's objectType vocabulary is just person/vehicle/animal; map YOLO's
