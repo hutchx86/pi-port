@@ -31,16 +31,41 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ADOPT_STATE_FILE = os.path.join(HERE, "adopt_state.json")
 CERT_PATH = os.path.join(HERE, "server.crt")
 KEY_PATH = os.path.join(HERE, "server.key")
+# RAM-only snapshot dir avclient.py's ffmpeg writes; same dir http_api.py serves.
+STREAM_DIR = config.stream_dir()
+
+# UCP4 record header (8 bytes): type u8, format u8, compressed u8, reserved u8,
+# length u32 BE. The controller's own parser reads it exactly this way
+# (`getUint8(1)`=format, `getUint8(2)`=compressed, `getUint32(4)`=length); a
+# JSON record is byte-identical to the older "version + 4 reserved + u16 length"
+# reading of the same 8 bytes, so existing traffic is unaffected.
+RECORD_TYPE_HEAD = 1
+RECORD_TYPE_BODY = 2
+RECORD_FORMAT_JSON = 1
+# format=3 means the body is a raw Buffer, not JSON. Needed to hand the
+# controller a JPEG byte-for-byte (it checks `Buffer.isBuffer()`).
+RECORD_FORMAT_RAW = 3
 
 
 def pack_record(record_type: int, payload: dict) -> bytes:
     body = json.dumps(payload).encode()
-    header = struct.pack(">BB4sH", record_type, 1, b"\x00\x00\x00\x00", len(body))
+    header = struct.pack(">BBBBI", record_type, RECORD_FORMAT_JSON, 0, 0, len(body))
     return header + body
 
 
+def pack_raw_record(record_type: int, payload: bytes) -> bytes:
+    header = struct.pack(">BBBBI", record_type, RECORD_FORMAT_RAW, 0, 0, len(payload))
+    return header + payload
+
+
 def pack_message(head: dict, body: dict) -> bytes:
-    return pack_record(1, head) + pack_record(2, body)
+    return pack_record(RECORD_TYPE_HEAD, head) + pack_record(RECORD_TYPE_BODY, body)
+
+
+def pack_raw_message(head: dict, body: bytes) -> bytes:
+    """Head as JSON, body as raw bytes (format=3) so the controller resolves a
+    Buffer rather than a parsed object -- how a real device returns a JPEG."""
+    return pack_record(RECORD_TYPE_HEAD, head) + pack_raw_record(RECORD_TYPE_BODY, body)
 
 
 def unpack_all_records(data: bytes):
@@ -50,16 +75,35 @@ def unpack_all_records(data: bytes):
         if len(data) - off < 8:
             log.warning("trailing %d bytes, not enough for a record header", len(data) - off)
             break
-        rtype, version, reserved, length = struct.unpack(">BB4sH", data[off:off + 8])
+        rtype, rec_format, _compressed, _reserved, length = struct.unpack(
+            ">BBBBI", data[off:off + 8])
         off += 8
         payload = data[off:off + length]
         off += length
-        try:
-            obj = json.loads(payload)
-        except json.JSONDecodeError:
-            obj = {"_raw": payload.decode(errors="replace")}
-        records.append((rtype, version, obj))
+        if rec_format == RECORD_FORMAT_RAW:
+            obj = {"_raw_bytes": payload}
+        else:
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                obj = {"_raw": payload.decode(errors="replace")}
+        records.append((rtype, rec_format, obj))
     return records
+
+
+class RawReply:
+    """Marker: reply body is raw bytes (format=3), not JSON."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+
+class ErrorReply:
+    """Marker: reply with a non-zero errorCode so the controller falls back."""
+
+    def __init__(self, error_code: int, error: str = ""):
+        self.error_code = error_code
+        self.error = error
 
 
 def wait_for_adopt_state(fallback_host_port, poll_interval=1.0, fallback_after=10.0):
@@ -90,6 +134,32 @@ def build_ssl_context():
     ctx.verify_mode = ssl.CERT_NONE
     ctx.load_cert_chain(CERT_PATH, KEY_PATH)
     return ctx
+
+
+def _read_snapshot_jpeg(timeout=2.0):
+    """Return the freshest complete JPEG any paired camera wrote to STREAM_DIR,
+    or None. The controller's snapshot request carries no camera id (real AI
+    Ports serve the same way), so the newest frame is the best available match;
+    a torn/mid-write file is retried briefly and skipped."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            names = [n for n in os.listdir(STREAM_DIR) if n.endswith(".jpg")]
+        except OSError:
+            names = []
+        names.sort(key=lambda n: os.path.getmtime(os.path.join(STREAM_DIR, n)),
+                   reverse=True)
+        for name in names[:3]:
+            try:
+                with open(os.path.join(STREAM_DIR, name), "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if len(data) > 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
+                return data
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
 
 
 def handle_action(head, body, device_info):
@@ -123,6 +193,21 @@ def handle_action(head, body, device_info):
     if action == "changeUserPassword":
         log.info("changeUserPassword requested (not persisted in this emulator)")
         return {}
+
+    if action == "getSnapshot":
+        # Protect fetches a paired camera's overview/timeline thumbnail from the
+        # AI Port (not the camera) once the camera is paired and the AI Port
+        # advertises supportUcp4. The device must reply with the JPEG as a raw
+        # (format=3) body; `{}` makes the controller fall back to the REST
+        # snapshot path and, on failure, leaves the event without a thumbnail.
+        data = _read_snapshot_jpeg()
+        if data:
+            log.info("getSnapshot: replying with %d-byte JPEG from %s", len(data), STREAM_DIR)
+            return RawReply(data)
+        log.warning("getSnapshot requested but no captured frame is available in %s "
+                    "-- reporting an error so the controller falls back to REST",
+                    STREAM_DIR)
+        return ErrorReply(1, "no snapshot available")
 
     # Ack `{}` so the controller's RPC doesn't hang; log it for shape discovery.
     return {}
@@ -216,14 +301,20 @@ def _consume(ws, device_info):
 
         reply_body = handle_action(head, body, device_info)
         if head.get("id"):
-            reply = pack_message(
-                {"timestamp": int(time.time() * 1000), "type": "response",
-                 "action": head.get("action"), "id": head["id"], "errorCode": 0},
-                reply_body,
-            )
-            ws.send(reply)
-            log.info(">>> replied to action=%s id=%s body=%s",
-                      head.get("action"), head.get("id"), reply_body)
+            error_code, error, binary = 0, "", None
+            if isinstance(reply_body, RawReply):
+                binary, reply_body = reply_body.data, {}
+            elif isinstance(reply_body, ErrorReply):
+                error_code, error = reply_body.error_code, reply_body.error
+            reply_head = {"timestamp": int(time.time() * 1000), "type": "response",
+                          "action": head.get("action"), "id": head["id"],
+                          "errorCode": error_code, "error": error}
+            frame = (pack_raw_message(reply_head, binary) if binary is not None
+                     else pack_message(reply_head, reply_body))
+            ws.send(frame)
+            log.info(">>> replied to action=%s id=%s errorCode=%s body=%s",
+                      head.get("action"), head["id"], error_code,
+                      f"<{len(binary)} raw bytes>" if binary is not None else reply_body)
 
 
 def main():
@@ -255,11 +346,13 @@ def main():
     args.iface = config.resolve_iface(args.iface, cfg)
 
     if args.state_dir:
-        global ADOPT_STATE_FILE, CERT_PATH, KEY_PATH
+        global ADOPT_STATE_FILE, CERT_PATH, KEY_PATH, STREAM_DIR
         os.makedirs(args.state_dir, exist_ok=True)
         ADOPT_STATE_FILE = os.path.join(args.state_dir, "adopt_state.json")
         CERT_PATH = os.path.join(args.state_dir, "server.crt")
         KEY_PATH = os.path.join(args.state_dir, "server.key")
+        # Same RAM-only dir avclient.py writes and http_api.py serves.
+        STREAM_DIR = config.stream_dir(args.state_dir)
 
     mac_nosep = config.resolve_mac(args.iface, args.mac, cfg).lower()
     ip = config.resolve_ip(args.iface, cfg, args.bind_ip)

@@ -3,8 +3,11 @@
 """Unit tests for ucp4_client.py's wire framing (pack/unpack records)."""
 import json
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +41,27 @@ class TestPackRecord(unittest.TestCase):
         self.assertEqual(recs[0][2], {"h": 1})
         self.assertEqual(recs[1][2], {"b": 2})
 
+    def test_header_uses_u32_length(self):
+        # A body larger than 65535 must round-trip (a u16 length would truncate).
+        payload = {"blob": "x" * 70000}
+        rec = ucp4_client.pack_record(2, payload)
+        self.assertEqual(struct.unpack(">I", rec[4:8])[0], len(rec) - 8)
+        self.assertEqual(ucp4_client.unpack_all_records(rec)[0][2], payload)
+
+    def test_raw_record_format3(self):
+        jpeg = b"\xff\xd8" + b"\x00" * 100000 + b"\xff\xd9"
+        rec = ucp4_client.pack_raw_record(2, jpeg)
+        rtype, rec_format, _compressed, _reserved, length = struct.unpack(">BBBBI", rec[:8])
+        self.assertEqual((rtype, rec_format, length), (2, 3, len(jpeg)))
+        self.assertEqual(rec[8:], jpeg)
+
+    def test_pack_raw_message_head_json_body_raw(self):
+        data = ucp4_client.pack_raw_message({"type": "response", "id": "n"}, b"\xff\xd8\xff\xd9")
+        recs = ucp4_client.unpack_all_records(data)
+        self.assertEqual(recs[0][2], {"type": "response", "id": "n"})
+        self.assertEqual(recs[1][1], 3)  # raw format marker
+        self.assertEqual(recs[1][2], {"_raw_bytes": b"\xff\xd8\xff\xd9"})
+
 
 class TestUnpackAllRecords(unittest.TestCase):
     def test_roundtrip_multiple(self):
@@ -63,6 +87,43 @@ class TestUnpackAllRecords(unittest.TestCase):
         recs = ucp4_client.unpack_all_records(data)
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0][2], {"a": 1})
+
+
+class TestGetSnapshot(unittest.TestCase):
+    """handle_action('getSnapshot') feeds Protect's paired-camera overview /
+    timeline thumbnail fetch, which targets the AI Port over UCP4."""
+
+    def setUp(self):
+        self._orig = ucp4_client.STREAM_DIR
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        ucp4_client.STREAM_DIR = self.d
+        self.addCleanup(lambda: setattr(ucp4_client, "STREAM_DIR", self._orig))
+
+    def _write(self, name, data, age=0.0):
+        path = os.path.join(self.d, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        if age:
+            os.utime(path, (time.time() - age, time.time() - age))
+
+    def test_returns_newest_valid_jpeg_as_raw(self):
+        self._write("old.jpg", b"\xff\xd8old\xff\xd9", age=10)
+        self._write("new.jpg", b"\xff\xd8new\xff\xd9")
+        reply = ucp4_client.handle_action({"action": "getSnapshot"}, {}, {})
+        self.assertIsInstance(reply, ucp4_client.RawReply)
+        self.assertEqual(reply.data, b"\xff\xd8new\xff\xd9")
+
+    def test_skips_torn_frame(self):
+        self._write("good.jpg", b"\xff\xd8good\xff\xd9", age=10)
+        self._write("torn.jpg", b"\xff\xd8half")  # no EOI
+        reply = ucp4_client.handle_action({"action": "getSnapshot"}, {}, {})
+        self.assertEqual(reply.data, b"\xff\xd8good\xff\xd9")
+
+    def test_no_frame_reports_error(self):
+        reply = ucp4_client.handle_action({"action": "getSnapshot"}, {}, {})
+        self.assertIsInstance(reply, ucp4_client.ErrorReply)
+        self.assertNotEqual(reply.error_code, 0)
 
 
 if __name__ == "__main__":

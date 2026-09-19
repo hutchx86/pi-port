@@ -13,6 +13,8 @@ import os
 import ssl
 import subprocess
 import sys
+import time
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -50,6 +52,31 @@ def _is_adopted() -> bool:
         return False
 
 
+def _freshest_jpeg(stream_dir, timeout=2.0):
+    """Newest complete JPEG in stream_dir, or None. ffmpeg rewrites each
+    camera's `<deviceID>.jpg` in place, so a read can catch a torn frame; retry
+    briefly and skip malformed files rather than serving a half-written image."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            names = [n for n in os.listdir(stream_dir) if n.endswith(".jpg")]
+        except OSError:
+            names = []
+        names.sort(key=lambda n: os.path.getmtime(os.path.join(stream_dir, n)),
+                   reverse=True)
+        for name in names[:3]:
+            try:
+                with open(os.path.join(stream_dir, name), "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if len(data) > 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
+                return name, data
+        if time.monotonic() >= deadline:
+            return None, None
+        time.sleep(0.2)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "piport-http/0.1"
 
@@ -66,6 +93,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not length:
             return b""
         return self.rfile.read(length)
+
+    def _route(self):
+        # Strip any query string (`snapshot?source=2`) so routing matches.
+        return urlsplit(self.path).path.rstrip("/")
 
     def _info_payload(self):
         cfg = self.server.aiport_config
@@ -91,14 +122,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         log.info("GET %s from %s", self.path, self.client_address)
-        if self.path.rstrip("/") in ("/api/info", "/info"):
+        route = self._route()
+        if route in ("/api/info", "/info"):
             self._json(200, self._info_payload())
-        elif self.path.rstrip("/") in ("/api/support", "/support"):
+        elif route in ("/api/support", "/support"):
             self._json(200, {"statusCode": 200})
-        elif self.path.rstrip("/") in ("/api/1.2/status",):
+        elif route in ("/api/1.2/status",):
             self._serve_status()
-        elif self.path.rstrip("/") in ("/api/1.2/snapshot",):
-            # REST snapshot pull (GET) is separate from POST /api/1.2/snapshot; same handler.
+        elif route in ("/api/1.2/snapshot", "/api/snapshot"):
+            # REST snapshot pull (GET) is separate from POST; same handler.
+            # `/api/snapshot` is the path the controller's ucp4 api-request uses.
             self._serve_snapshot()
         else:
             log.warning("unhandled GET path %s -- replying 200 anyway", self.path)
@@ -130,7 +163,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         log.info("POST %s from %s body=%s", self.path, self.client_address,
                   json.dumps(payload))
 
-        path = self.path.rstrip("/")
+        path = self._route()
         if path in ("/api/adopt", "/adopt"):
             mgmt_payload = payload
             self._persist_adopt(mgmt_payload)
@@ -152,7 +185,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path in ("/api/1.2/snapshot",):
+        elif path in ("/api/1.2/snapshot", "/api/snapshot"):
             # Serve the latest frame avclient.py's ffmpeg wrote to STREAM_DIR; 404 if none yet.
             self._serve_snapshot()
         else:
@@ -160,25 +193,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"statusCode": 200})
 
     def _serve_snapshot(self):
-        stream_dir = STREAM_DIR
-        try:
-            files = sorted(os.listdir(stream_dir)) if os.path.isdir(stream_dir) else []
-        except OSError:
-            files = []
-        jpg = next((f for f in files if f.endswith(".jpg")), None)
-        if not jpg:
-            log.warning("snapshot requested but no captured frame available yet")
+        # The controller requests a paired camera's snapshot from the AI Port
+        # (no camera id in the request), so the freshest complete frame is the
+        # best available match. A torn/mid-write JPEG would be rejected by the
+        # controller and leave the event without a thumbnail.
+        name, data = _freshest_jpeg(STREAM_DIR)
+        if not name:
+            log.warning("snapshot requested but no complete captured frame available in %s",
+                        STREAM_DIR)
             self._json(404, {"statusCode": 404, "error": "no snapshot available"})
             return
-        path = os.path.join(stream_dir, jpg)
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError as e:
-            log.warning("failed to read snapshot %s: %s", path, e)
-            self._json(500, {"statusCode": 500})
-            return
-        log.info("serving snapshot from %s (%d bytes)", path, len(data))
+        log.info("serving snapshot from %s (%d bytes)", os.path.join(STREAM_DIR, name),
+                  len(data))
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(data)))

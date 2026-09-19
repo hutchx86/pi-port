@@ -550,13 +550,33 @@ def _record_snapshot_filename(filename, device_id, kind, coord=None):
         _last_object_coord_by_device[device_id] = coord
 
 
-def _resolve_snapshot_device(requested_filename, what):
+def _find_device_by_id(requested_device_id):
+    """Match a controller-supplied deviceID (a paired camera MAC, upper or lower
+    case, with or without separators) to a known active/known camera id, or None."""
+    if not requested_device_id:
+        return None
+    want = str(requested_device_id).lower().replace(":", "").replace("-", "")
+    if not want:
+        return None
+    known = list(_active_streams) + [d for d in _stream_dims if d not in _active_streams]
+    for device_id in known:
+        if str(device_id).lower().replace(":", "").replace("-", "") == want:
+            return device_id
+    return None
+
+
+def _resolve_snapshot_device(requested_filename, what, requested_device_id=None):
     """Resolve a snapshot GetRequest to a camera; returns (record, how), record
-    None if ambiguous. Falls back only to a sole active stream or sole recent
-    announcement."""
+    None if ambiguous. The controller's general snapshot request (camera
+    overview/timeline thumbnail) carries no `filename` but DOES carry a
+    `deviceID` naming the paired camera -- use it. Otherwise fall back only to a
+    sole active stream or sole recent announcement."""
     record = _snapshot_filename_to_device.get(requested_filename)
     if record is not None:
         return record, "filename"
+    device_id = _find_device_by_id(requested_device_id)
+    if device_id is not None:
+        return _fallback_record(device_id, what), "request deviceID"
     now = time.monotonic()
     recent = [dev for t, dev in _recent_snapshot_announcements
               if now - t <= SNAPSHOT_FALLBACK_WINDOW_S]
@@ -566,16 +586,20 @@ def _resolve_snapshot_device(requested_filename, what):
         return _fallback_record(active[0], what), "sole active stream"
     if len(distinct) == 1:
         return _fallback_record(distinct[0], what), "sole recent announcement"
-    log.warning("snapshot upload requested for unknown filename=%r (what=%r): %d active "
-                "stream(s), %d distinct camera(s) announced in the last %ds -- ambiguous, "
-                "refusing to guess", requested_filename, what, len(active), len(distinct),
+    log.warning("snapshot upload requested for unknown filename=%r (what=%r, deviceID=%r): "
+                "%d active stream(s), %d distinct camera(s) announced in the last %ds -- "
+                "ambiguous, refusing to guess",
+                requested_filename, what, requested_device_id, len(active), len(distinct),
                 SNAPSHOT_FALLBACK_WINDOW_S)
     return None, None
 
 
 def _fallback_record(device_id, what):
-    # `what` picks full-FoV vs per-object; an object request reuses the last coord so the crop matches.
-    kind = "fullfov" if "fullfov" in str(what or "").lower() else "object"
+    # Only smart-detect object snapshots are crops; a general "snapshot" (and
+    # FullFoV/motion) is the full frame, even if a stale coord is on file for
+    # this camera.
+    w = str(what or "").lower()
+    kind = "object" if ("smartdetect" in w and "fullfov" not in w) else "fullfov"
     coord = _last_object_coord_by_device.get(device_id) if kind == "object" else None
     return {"device_id": device_id, "kind": kind, "coord": coord}
 
@@ -620,18 +644,21 @@ def _wait_for_frame(path, timeout=2.0):
     return True
 
 
-def _upload_snapshot(upload_uri, device_info, requested_filename, what=None):
+def _upload_snapshot(upload_uri, device_info, requested_filename, what=None,
+                     requested_device_id=None):
     if not upload_uri:
         log.warning("snapshot GetRequest had no uri, nothing to upload")
         return
     # Resolve filename -> camera and read that camera's frame (never guess from directory contents).
-    record, resolved_by = _resolve_snapshot_device(requested_filename, what)
+    record, resolved_by = _resolve_snapshot_device(requested_filename, what,
+                                                   requested_device_id)
     if record is None:
         return
     device_id = record["device_id"]
-    if resolved_by != "filename":
-        log.warning("snapshot upload for unknown filename=%r (what=%r) resolved to deviceID=%s "
-                    "via %s", requested_filename, what, device_id, resolved_by)
+    if resolved_by not in ("filename",):
+        log.info("snapshot upload for filename=%r (what=%r, deviceID=%r) resolved to "
+                  "deviceID=%s via %s", requested_filename, what, requested_device_id,
+                  device_id, resolved_by)
     path = os.path.join(_STREAM_DIR, f"{device_id}.jpg")
     if not _wait_for_frame(path):
         log.warning("snapshot upload requested for deviceID=%s (filename=%s) but no captured "
@@ -949,7 +976,7 @@ def handle_function(ws, msg, device_info):
         send_msg(ws, "GetRequest", {}, in_response_to=msg_id)
         threading.Thread(target=_upload_snapshot,
                           args=(payload.get("uri"), device_info, payload.get("filename"),
-                                payload.get("what")),
+                                payload.get("what"), payload.get("deviceID")),
                           daemon=True).start()
         return
 

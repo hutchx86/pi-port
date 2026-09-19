@@ -215,6 +215,19 @@ class TestSnapshotResolution(Base):
         self.assertEqual(av._fallback_record("X", "smartDetectZoneSnapshotFullFoV")["kind"], "fullfov")
         self.assertEqual(av._fallback_record("X", "smartDetectZoneSnapshot")["kind"], "object")
 
+    def test_resolve_by_request_deviceid(self):
+        av._active_streams["AA:BB:CC"] = object()
+        rec, how = av._resolve_snapshot_device(None, "snapshot", "aa:bb:cc")
+        self.assertEqual((rec["device_id"], how), ("AA:BB:CC", "request deviceID"))
+        self.assertEqual(rec["kind"], "fullfov")  # general snapshot = full frame
+
+    def test_general_snapshot_not_cropped_by_stale_coord(self):
+        # A general "snapshot" must not reuse a stale per-object coord as a crop.
+        av._last_object_coord_by_device["AAA"] = [1, 2, 3, 4]
+        rec = av._fallback_record("AAA", "snapshot")
+        self.assertEqual(rec["kind"], "fullfov")
+        self.assertIsNone(rec["coord"])
+
     def test_wait_for_frame(self):
         with tempfile.TemporaryDirectory() as d:
             missing = os.path.join(d, "no.jpg")
