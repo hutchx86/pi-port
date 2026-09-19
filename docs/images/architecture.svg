@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="352" viewBox="0 0 760 352" role="img" aria-label="Pi Port data path: cameras stream to a UniFi Protect console, which discovers, adopts and relays video to an Orange Pi running the emulated AI Port, which returns detection events and snapshots">
+  <style>
+    .box  { fill:#f6f8fa; stroke:#57606a; stroke-width:1.5; rx:6; }
+    .pi   { fill:#eef4ff; stroke:#3b6fd4; stroke-width:1.5; rx:6; }
+    .h    { font:bold 14px -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; fill:#1f2328; }
+    .s    { font:12px -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; fill:#57606a; }
+    .l    { font:12px -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; fill:#3b6fd4; }
+    .edge { stroke:#57606a; stroke-width:1.6; fill:none; marker-end:url(#a); }
+    .edge2{ stroke:#3b6fd4; stroke-width:1.6; fill:none; marker-end:url(#b); }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#57606a"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#3b6fd4"/></marker>
+  </defs>
+
+  <rect class="box" x="30" y="24" width="300" height="76"/>
+  <text class="h" x="48" y="52">UniFi Protect console</text>
+  <text class="s" x="48" y="72">UNVR / UDM you own — recording,</text>
+  <text class="s" x="48" y="88">events, thumbnails</text>
+
+  <rect class="box" x="470" y="24" width="260" height="76"/>
+  <text class="h" x="488" y="52">Cameras</text>
+  <text class="s" x="488" y="72">Protect (native) or ONVIF,</text>
+  <text class="s" x="488" y="88">paired to the emulated AI Port</text>
+
+  <path class="edge" d="M470 62 H330"/>
+  <text class="s" x="345" y="54">video to Protect</text>
+
+  <path class="edge" d="M150 100 V210"/>
+  <text class="s" x="162" y="150">discovery UDP/10001</text>
+  <text class="s" x="162" y="168">adopt HTTPS :443</text>
+  <text class="s" x="162" y="186">WSS :7442 (ucp4 + avclient)</text>
+
+  <path class="edge2" d="M262 210 V100"/>
+  <text class="l" x="474" y="150" text-anchor="end">RTSP :7447 relay (pulled)</text>
+  <text class="l" x="474" y="168" text-anchor="end">EventSmartDetect + snapshots</text>
+
+  <rect class="pi" x="120" y="210" width="520" height="118"/>
+  <text class="h" x="140" y="238">Orange Pi 5 Plus (RK3588) — pi-port</text>
+  <text class="s" x="140" y="262">discovery.py   UDP/10001 responder</text>
+  <text class="s" x="140" y="280">http_api.py    HTTPS :443 adopt / snapshot API</text>
+  <text class="s" x="140" y="298">ucp4_client.py management WebSocket</text>
+  <text class="s" x="400" y="262">avclient.py   pairing, events, RTSP pull</text>
+  <text class="s" x="400" y="280">detector.py   YOLOv5 on the NPU</text>
+</svg>

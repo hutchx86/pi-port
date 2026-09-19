@@ -1,55 +1,116 @@
-# Pi Port -- a DIY UniFi Protect "AI Port" on an Orange Pi (RK3588)
+# Pi Port — a DIY UniFi Protect "AI Port" on an Orange Pi (RK3588)
 
-Pi Port is a reverse-engineering / interoperability proof of concept that makes
-a stock **Orange Pi 5 Plus (RK3588)** running Linux present itself to a real
-UniFi Protect console as a genuine **UniFi Protect AI Port** (catalog model
-`UVC AI Port`, sysid `0xa5f1`): L2 discovery, adoption, camera pairing, video
-relay, real NPU object detection, and dashboard detection events with
-thumbnails.
+<div align="center">
 
-It talks the vendor wire protocol only. It does not modify firmware, does not
-write to the controller's database, and ships no Ubiquiti code or binaries --
-you supply your own console, cameras, and (for reverse engineering) firmware.
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue" alt="License: AGPL-3.0-or-later"></a>
+<a href="https://github.com/hutchx86/pi-port/actions/workflows/ci.yml"><img src="https://github.com/hutchx86/pi-port/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 
-## What it is
+**A reverse-engineering / interoperability proof of concept that makes a stock
+Orange Pi 5 Plus (RK3588) present itself to a real UniFi Protect console as
+genuine AI Port hardware (catalog model `UVC AI Port`, sysid `0xa5f1`) —
+discovery, adoption, camera pairing, video relay, NPU object detection, and
+detection events with thumbnails.**
 
-- A working emulator of the AI Port device role, confirmed live against a real
-  UniFi Protect console: discovery, adoption, camera pairing, video relay, NPU
-  motion detection, dashboard events with thumbnails, and automatic un-adopt
-  detection, with real cameras paired and streamed concurrently.
-- A reference for the AI Port protocol, reverse-engineered from firmware on
-  hardware the author owns and documented in `piport/README.md`.
-- A hobbyist/PoC project. An experimental x86/no-NPU Docker variant lives on
-  the `experimental` branch.
+It talks the vendor wire protocol only: no firmware modification, no controller
+database writes, no Ubiquiti code or binaries.
 
-## What it is not
+</div>
 
-- **Not a product, and not production software.** It is a proof of concept.
-- **Not affiliated with, endorsed by, or connected to Ubiquiti Inc.** "UniFi",
-  "UniFi Protect" and "AI Port" are trademarks of Ubiquiti Inc.
-- **Not the original AI Port.** It does not run Ubiquiti firmware, does not use
-  Ubiquiti's own detection model, and does not provide the real device's
-  feature set -- see *How this differs from the real AI Port* below.
-- **Not a way to target other people's systems.** It is intended for
-  interoperability and personal use on hardware and consoles you own.
+> [!WARNING]
+> Proof of concept, not production software. It binds privileged ports
+> (UDP/10001, TCP/443) and manages macvlan interfaces and DHCP leases;
+> misconfiguration can disrupt your network or device. Use it only on hardware
+> and consoles you own. See [Disclaimer](#disclaimer).
 
-## How this differs from the real AI Port
+> [!NOTE]
+> Not affiliated with, endorsed by, or connected to Ubiquiti Inc. "UniFi",
+> "UniFi Protect" and "AI Port" are trademarks of Ubiquiti Inc. No Ubiquiti
+> firmware or binaries are distributed here. Built with AI assistance under
+> human review — verify anything you rely on. See [Legal](#legal).
 
-| | Real AI Port | Pi Port |
-|---|---|---|
-| Hardware | Ubiquiti AI Port (Ambarella) | Orange Pi 5 Plus (RK3588) |
-| Firmware | Ubiquiti, signed | none; this repo's Python |
-| Detection model | Ubiquiti's own classifier | stock YOLOv5 (person/vehicle/animal) |
-| Output | full Ubiquiti product behaviour | the subset this project implements |
+## Quick start
 
-It is a protocol-compatible stand-in built on the shared camera/chime
+```bash
+git clone https://github.com/hutchx86/pi-port && cd pi-port
+sudo scripts/install.sh --console <console-ip> [--parent-iface <iface>]
+# then adopt "AI Port" in Protect and pair a camera to it
+```
+
+## At a glance
+
+|  |  |
+| --- | --- |
+| **What** | Emulates the UniFi Protect AI Port device role on an RK3588 board |
+| **Hardware** | Orange Pi 5 Plus (RK3588) |
+| **Protocol / interface** | UBNT discovery UDP/10001; mTLS WSS :7442 (`ucp4` + classic avclient); RTSP relay :7447 |
+| **Language** | Python 3 |
+| **Status** | Working against a real Protect console — 4 cameras paired and streamed concurrently |
+| **License** | AGPL-3.0-or-later |
+
+## How it compares
+
+|  | Real AI Port | Pi Port |
+| --- | --- | --- |
+| **What it is** | Ubiquiti AI Port appliance (Ambarella) | This repo's Python, on an Orange Pi 5 Plus (RK3588) |
+| **Firmware** | Ubiquiti, signed | None — the emulator itself |
+| **Detection model** | Ubiquiti's own classifier | Stock YOLOv5 (person/vehicle/animal), RKNN on the NPU |
+| **Output** | Full Ubiquiti product behaviour | The subset this project implements |
+
+It is a protocol-compatible stand-in built on the same shared camera/chime
 middleware, not a clone of the device.
 
-## AI-assisted development
+## How it works
 
-Large parts of this project were produced with LLMs (Claude Code and DeepSeek)
-under human supervision, review, and real-hardware testing. Verify anything you
-rely on. See *Disclaimer*.
+The board answers the console's L2 discovery, then adopts like a classic camera
+(`POST /api/1.2/manage` on HTTPS :443). It keeps two mTLS WebSocket connections
+to the console — the generic `ucp4` channel for management RPCs, and the classic
+avclient channel for camera pairing and detection events. When a camera is
+paired, the console hands the board an RTSP URL on its own internal relay
+(`:7447`); the board pulls that stream, runs YOLOv5 on the NPU, and pushes
+`EventSmartDetect` events and snapshot uploads back to the console.
+
+<img src="docs/images/architecture.svg" width="760" alt="Pi Port data path: cameras → Protect console → emulated AI Port on the Orange Pi">
+
+| Component | Language | Role |
+| --- | --- | --- |
+| `discovery.py` | Python | UDP/10001 UBNT discovery responder |
+| `http_api.py` | Python | HTTPS :443 adopt / control / snapshot API |
+| `ucp4_client.py` | Python | Generic `ucp4` device-management WebSocket |
+| `avclient.py` | Python | Pairing, streaming and smart-detect WebSocket + detection loop |
+| `detector.py` | Python | YOLOv5 inference wrapper (RKNN / NPU) |
+| `sysinfo_server.py` | Python | Dev-box CPU/mem/GPU/NPU status page (`webui.html`) |
+| `instance_manager.py`, `run_all.py` | Python | Multi-instance orchestration |
+
+## Supported hardware
+
+| Model | SoC / variant | Status | Notes |
+| --- | --- | --- | --- |
+| Orange Pi 5 Plus | RK3588 | Verified | The target board; 4 real cameras paired and streamed concurrently |
+| Other RK3588 boards | RK3588 | Untested | Should work; the NPU and ffmpeg paths are RK3588-specific |
+
+## Features
+
+- **Emulated AI Port device role** — L2 discovery, adoption, and both WebSocket
+  connections a real console expects.
+- **Camera pairing and video relay** — pairs real cameras and pulls their stream
+  from Protect's internal RTSP relay.
+- **Real NPU object detection** — YOLOv5 → RKNN on the RK3588 NPU
+  (person/vehicle/animal), not a placeholder.
+- **Detection events with thumbnails** — `EventSmartDetect` with per-object
+  snapshots and Full-FoV images, plus the overview/timeline thumbnails.
+- **Multi-instance** — one reboot-surviving systemd unit and macvlan interface
+  per instance, each a distinct L2 device, with a small web UI.
+- **Honest state handling** — reflects real adopted state and clears local state
+  on the console's reset.
+
+## Requirements
+
+- Orange Pi 5 Plus (or another RK3588 board) running Linux, with root — the
+  emulator binds UDP/10001 and TCP/443.
+- Python 3, and `rknn-toolkit-lite2` on the board for NPU inference.
+- A UniFi Protect console you own and control, on the same LAN.
+- For model conversion: an x86_64 Linux host with `rknn-toolkit2` (the RKNN
+  converter does not run on the board).
 
 ## Repository layout
 
@@ -65,26 +126,19 @@ piport/            the emulator (RK3588 / Orange Pi)
   instance_manager.py / run_all.py  multi-instance orchestration
 scripts/           install.sh (one-shot installer), fetch_models.py, helpers
 rknn_convert/      YOLOv5s -> RKNN conversion recipe (x86 build host)
+docs/images/       README diagram
 ```
 
 Model binaries (`.onnx`/`.rknn`) and all Ubiquiti firmware are **not** stored
-here; see *Model assets* below. `piport/README.md` has the protocol detail and
-per-component notes. The x86/no-NPU Docker variant lives on the `experimental`
-branch.
+here; see [Model assets](#model-assets-not-tracked). `piport/README.md` has the
+protocol detail and per-component notes. The x86/no-NPU Docker variant lives on
+the `experimental` branch.
 
-## Requirements
+## Install / Usage
 
-- Orange Pi 5 Plus (or another RK3588 board) running Linux, with root -- the
-  emulator binds UDP/10001 and TCP/443.
-- Python 3, and `rknn-toolkit-lite2` on the board for NPU inference.
-- A UniFi Protect console you own and control on the same LAN.
-
-## Install (RK3588 / Orange Pi)
-
-On the board itself, `scripts/install.sh` does the whole stand-up: system
-packages, a venv + dependencies, model assets, the required `librknnrt.so`
-upgrade, a reboot-surviving systemd instance (via `instance_manager.py`), and
-the web UI:
+`scripts/install.sh` does the whole stand-up on the board: system packages, a
+venv + dependencies, model assets, the required `librknnrt.so` upgrade, a
+reboot-surviving systemd instance (via `instance_manager.py`), and the web UI.
 
 ```bash
 sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
@@ -92,13 +146,25 @@ sudo scripts/install.sh --console <UNVR-IP> [--parent-iface <iface>]
 
 - Run from the checkout root, as root. `--parent-iface` defaults to the
   auto-detected default-route NIC.
-- The NPU model cannot be built on the Pi (the RKNN converter is x86_64-only).
-  Build it on an x86 host with `scripts/fetch_models.py --convert`, or let the
-  installer fetch it from `--rknn-url` / `PIPORT_RKNN_URL` / its default URL.
-  `--rknn <path>` takes a local build, and a local `models-rknn/` submodule is
-  also detected. Use `--no-npu` for a CPU-only protocol-stack install.
+- The NPU model cannot be built on the Pi; build it on an x86 host
+  (`scripts/fetch_models.py --convert`) or let the installer fetch it from
+  `--rknn-url` / `PIPORT_RKNN_URL` / its default URL. `--rknn <path>` takes a
+  local build, and a local `models-rknn/` submodule is also detected. Use
+  `--no-npu` for a CPU-only protocol-stack install.
 - Opens the web UI on `:8090` (`--webui-port` to change) for board stats and
   instance management.
+
+Then, in Protect:
+
+1. Adopt "AI Port" from the console UI like any camera.
+2. Pair a real camera to it from the camera's own settings page.
+3. Detections appear as dashboard events with thumbnails, and the console's own
+   person/vehicle/animal filters work.
+
+`run_all.py` needs root (binds UDP/10001 and TCP/443) and must be able to send L2
+broadcast/multicast on the LAN, so run it on the host, not in a NAT'd container.
+It resolves its own interface's IP by default, so multiple instances on one box
+don't collide on `:443`.
 
 ### Manual install
 
@@ -121,22 +187,9 @@ $EDITOR piport/aiport.cfg
 sudo python3 piport/run_all.py --iface <your-iface>
 ```
 
-## Use
+### Single instance (systemd)
 
-1. Adopt "AI Port" from the Protect console UI like any camera.
-2. Pair a real camera to it from the camera's own settings page.
-3. Detections then appear as dashboard events with thumbnails, and the
-   console's own person/vehicle/animal filters work.
-
-`run_all.py` needs root (binds UDP/10001 and TCP/443) and must be able to send
-L2 broadcast/multicast on the LAN, so run it on the host, not in a NAT'd
-container. It resolves its own interface's IP by default, so multiple instances
-on one box don't collide on `:443`.
-
-### Single instance (RK3588)
-
-Run it directly (`sudo python3 piport/run_all.py --iface <iface>`), or under
-systemd for reboot survival. A minimal unit:
+A minimal unit for reboot survival:
 
 ```ini
 [Unit]
@@ -157,11 +210,11 @@ WantedBy=multi-user.target
 `KillMode=control-group` matters: `run_all.py` spawns four child processes and
 only reaps them on `KeyboardInterrupt`, so a plain SIGTERM would orphan them.
 
-### Multiple instances (RK3588)
+### Multiple instances
 
 `instance_manager.py` creates one systemd unit per instance, each with its own
-macvlan sub-interface, MAC, and DHCP lease -- a distinct L2 device, so the
-console sees independent AI Ports:
+macvlan sub-interface, MAC, and DHCP lease — a distinct L2 device, so the console
+sees independent AI Ports:
 
 ```bash
 sudo python3 piport/instance_manager.py create lab2 --parent-iface <iface>
@@ -177,27 +230,19 @@ instances.
 ### x86 / Docker variant
 
 The x86/no-NPU Docker variant is not part of `main`; it is maintained on the
-`experimental` branch (`piport/x86/`, onnxruntime on CPU). Check it out with:
+`experimental` branch (`piport/x86/`, onnxruntime on CPU):
 
 ```bash
 git switch experimental
 ```
 
-### Operational notes
-
-- Never `pkill -f 'run_all.py'`: the pattern matches the killing command
-  itself. Use `pkill -9 -f '[r]un_all.py'`, and separately kill orphaned
-  ffmpeg children (`pkill -9 -f '[f]fmpeg.*rtsp://<console-ip>:7447'`).
-- To start detached over SSH, use `setsid -f` (a backgrounded `nohup` can hang
-  the SSH channel).
-
-## Model assets (not tracked)
+### Model assets (not tracked)
 
 The detector needs an open YOLOv5 model. Because the binaries are large and
 reproducible, they are not committed; `scripts/fetch_models.py` downloads them:
 
 | Asset | Used by | Source |
-|---|---|---|
+| --- | --- | --- |
 | `yolov5s_relu.onnx` (27.6 MiB) | RKNN conversion (`.rknn`) | Rockchip model zoo delivery: <https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yolov5/yolov5s_relu.onnx> |
 | anchors, COCO labels, bus.jpg, calibration subset | RKNN conversion | <https://github.com/airockchip/rknn_model_zoo> (tag `v2.3.2`) |
 
@@ -207,8 +252,8 @@ The experimental x86 variant additionally uses Ultralytics `yolov5n.onnx`
 auto-detected); see that branch's README.
 
 `yolov5s_relu.rknn` is produced on an x86_64 machine with `rknn-toolkit2`
-(install from PyPI or the Rockchip GitHub release -- see
-`rknn_convert/convert.py` and `piport/README.md`):
+(install from PyPI or the Rockchip GitHub release — see `rknn_convert/convert.py`
+and `piport/README.md`):
 
 ```bash
 python3 scripts/fetch_models.py --convert
@@ -230,54 +275,114 @@ AGPL-3.0 text and attribution; the corresponding source is this repo's
 conversion recipe plus the ONNX in the table above. Check those licenses
 yourself before redistributing.
 
+## Configuration
+
+Device identity, network mode and the console address live in
+`piport/aiport.cfg`; CLI flags on each script override it.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `[identity] mac` | derived | Device MAC (12 hex chars). Blank derives one from the interface's OUI |
+| `[identity] platform` | `UVC AI Port` | Catalog model string the console matches (must be exact) |
+| `[identity] sysid` | `0xa5f1` | Hardware/model id |
+| `[identity] device_id` | per-instance | Persistent device UUID (must be unique per instance) |
+| `[network] iface` / `mode` / `ip` | auto / `dhcp` / — | Interface to bind, and `dhcp` or `static` addressing |
+| `[console] host` / `port` | — / `7442` | The Protect console to dial when not yet adopted |
+
 ## Verification
 
-Unit suite (no hardware required):
+- Unit suite (no hardware required):
+
+  ```bash
+  cd piport && python3 -m unittest discover -s tests
+  ```
+
+- On-device: run the stack on the Orange Pi and watch it discover, adopt and pair
+  (see `piport/README.md` and `scripts/live_watch.py`).
+
+## Roadmap / known limitations
+
+- **Known:** detection is stock YOLOv5 (person/vehicle/animal) on the RK3588 NPU,
+  not Ubiquiti's classifier; face recognition, license-plate recognition and
+  vehicle classification are not implemented.
+- **Known:** the x86/no-NPU Docker variant is maintained on the `experimental`
+  branch and is not verified on real hardware.
+- **Planned:** stress-testing multiple cameras beyond the four-camera live setup.
+
+## Troubleshooting
+
+<details>
+<summary><b>Troubleshooting / operational notes</b></summary>
+
+**A partial restart leaves stale connections.** Restart the full four-process
+stack (beacon/discovery, adopt HTTP, ucp4, avclient) — a partial restart leaves
+untouched connections in stale state. `run_all.py` starts all four together.
+
+**`pkill -f 'run_all.py'` kills itself.** The pattern matches the killing command
+line. Use the bracket trick and also kill orphaned ffmpeg children:
 
 ```bash
-cd piport && python3 -m unittest discover -s tests
+pkill -9 -f '[r]un_all.py'
+pkill -9 -f '[f]fmpeg.*rtsp://<console-ip>:7447'
 ```
 
-Live verification is done on the Orange Pi (see `piport/README.md` and
-`scripts/live_watch.py`).
+**Starting detached over SSH hangs.** A backgrounded `nohup` can hold the SSH
+channel open; use `setsid -f <command> >log 2>&1 </dev/null`.
 
-## Legal
+**Multiple instances collide on `:443`.** Bind each instance to its own
+interface's real IP (the default) rather than `0.0.0.0` — a wildcard bind claims
+the port on every address on the box.
 
-- **Not affiliated with or endorsed by Ubiquiti Inc.**
-- **No Ubiquiti binaries or firmware are distributed here.** You supply your
-  own firmware images; reverse-engineering may be restricted in your
-  jurisdiction and you are responsible for how you use this.
+</details>
+
+## Credits
+
+Special thanks to
+[dciancu/unifi-protect-unvr-docker-arm64](https://github.com/dciancu/unifi-protect-unvr-docker-arm64)
+— the inspiration for getting into UniFi tinkering in general, and whose methods
+helped in learning how parts of it work.
+
+Protocol work was informed by the open-source UniFi community; the detection
+model and conversion recipe come from Rockchip's model zoo. Third-party
+components and their licenses are listed in [CREDITS.md](CREDITS.md).
+
+<details>
+<summary><b>Legal</b></summary>
+
+- **Not affiliated with, or endorsed by, Ubiquiti Inc.** "UniFi", "UniFi
+  Protect" and "AI Port" are trademarks of Ubiquiti Inc.
+- **No Ubiquiti firmware or binaries are distributed here.** You supply your own
+  console, cameras and (for reverse engineering) firmware images.
 - Intended for interoperability and personal use on hardware and consoles you
-  own. Nothing here targets third-party systems.
+  own. Reverse-engineering may be restricted in your jurisdiction, and you are
+  responsible for how you use this. Nothing here targets third-party systems.
 
-## Disclaimer
+</details>
 
-**Proof of concept, not production software.** Large parts were produced with
-LLMs under human supervision and testing -- review and verify everything
-yourself. This software is provided "as is", without warranty of any kind. It
-binds privileged ports, manipulates network interfaces (macvlan/DHCP), and
-runs detection hardware; misconfiguration can disrupt your network or device.
-By using it you accept full responsibility for any damage, data loss, or other
-consequences. **The authors and contributors are not responsible or liable
-for any loss or damage arising from its use.**
+<details>
+<summary><b>Disclaimer</b></summary>
+
+**This is a proof-of-concept project, not a production-ready system.** Large
+parts were produced with LLMs (Claude Code and DeepSeek) under human supervision,
+review, and real-hardware testing — review and verify everything yourself.
+**This software is provided "as is", without warranty of any kind.** It binds
+privileged ports, manipulates network interfaces (macvlan/DHCP), and runs
+detection hardware; misconfiguration can disrupt your network or device. By using
+it you accept full responsibility for any damage, data loss, or other
+consequences. **The authors and contributors are not responsible or liable for
+any loss or damage arising from its use.**
+
+</details>
+
+## Security
+
+Report vulnerabilities privately via GitHub Security Advisories. Runtime state —
+the adoption token and the mTLS client certificate/key — is written to the
+instance state directory (`--state-dir`) and excluded by `.gitignore`; never
+commit it. No secrets are stored in this repository.
 
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE). Because this is a network service,
 anyone who runs a modified version for others to interact with over a network
 must offer them the corresponding source.
-
-## Credits
-
-Special thanks to
-[dciancu/unifi-protect-unvr-docker-arm64](https://github.com/dciancu/unifi-protect-unvr-docker-arm64)
--- the inspiration for getting into UniFi tinkering in general, and whose
-methods in that repo helped me learn and understand how parts of it work.
-
-Protocol work was informed by the open-source UniFi community, including
-[rjmotion/pyunifiwire](https://github.com/rjmotion/pyunifiwire) discovery notes
-and
-[danielwoz/ubiquiti-protect-onvif-event-listener](https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener)
-as a schema reference (its database-write approach is deliberately not used
-here). The detection model and conversion recipe come from
-[airockchip/rknn_model_zoo](https://github.com/airockchip/rknn_model_zoo).
