@@ -926,24 +926,47 @@ def _send_status_event(ws, device_id, plug, streaming, smart_ready, audio_ready)
 
 
 def _send_feature_flags_event(ws, device_id):
-    # Capability declaration; honest to the detector's RKNN classes (person/vehicle/animal).
-    # Several UI features are derived by the controller's `deserializeFromCamera` from
-    # THIS array, not from top-level keys:
-    #   hasLineCrossing       = smartDetect.includes("lineCrossing")
-    #   hasLiveviewTracking   = smartDetect.includes("liveviewTracking")
-    # hasLiveviewTracking is what the web UI's live-view object-overlay ("Highlight
-    # Detected Motion" / "Object Overlay" / "Highlight Camera Motion") gates on: the app
-    # filters the stored overlay selection through the camera capability, so without it
-    # the toggle silently resyncs back to off. lineCrossingCounting stays off (not
-    # implemented), so it is not included. Constant per pairing -> send once per
-    # controller connection (re-sending only re-triggers Protect's settings push).
+    # Capability declaration for a paired camera.
+    #
+    # The controller's handleFeaturesFlagUpdate() does a WHOLESALE replace of the
+    # camera's featureFlags with the allowlisted subset taken verbatim from this
+    # map (`.map(key => [key, r[key]])`) -- a key we omit deserialises to
+    # undefined/false/null and WIPES the camera's real value. So this payload
+    # mirrors what a genuine AI Port sends, using the real device's own key names
+    # (see ubnt_avclient's ComposeFeatureFlags) and this hardware's genuine
+    # values (AI Port fw 5.1.12 /etc/features.conf).
+    #
+    # deserializeFromCamera() maps device key -> camera flag:
+    #   motionDetect        -> motionAlgorithms
+    #   privacyMask         -> hasPrivacyMask
+    #   privacyMasks        -> privacyMaskCapability
+    #   squareEventThumbnail-> hasSquareEventThumbnail
+    #   excludeZone         -> excludeZones
+    #   smartDetect         -> smartDetectTypes / hasSmartDetect / hasLineCrossing
+    #                          / hasLineCrossingCounting / hasLiveviewTracking
+    #   (hasMotionZones, hasIcrSensitivity are hardcoded true server-side)
+    #
+    # We previously sent motionDetect:["stable"] (clobbering the camera's real
+    # "enhanced", and rewriting recordingSettings.motionAlgorithm with it) and
+    # omitted privacyMask/privacyMasks/squareEventThumbnail entirely (wiping
+    # them). Verified live: a paired camera had motionAlgorithms ["stable"],
+    # hasPrivacyMask false, privacyMaskCapability.maxMasks null,
+    # hasSquareEventThumbnail false -- none of which match the hardware.
+    #
+    # Only smartDetect is genuinely AI-Port-owned. Constant per pairing -> send
+    # once per controller connection (re-sending only re-triggers Protect's
+    # settings push).
     if device_id in _feature_flags_sent:
         return
     _feature_flags_sent.add(device_id)
     send_msg(ws, "EventFeatureFlagsUpdated", {
         "deviceID": device_id,
         "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
-        "motionDetect": ["stable"],
+        # Real key names + genuine hardware values (echoed, not owned).
+        "motionDetect": ["enhanced"],
+        "privacyMask": True,
+        "privacyMasks": {"maxZones": 16, "rectangleOnly": False},
+        "squareEventThumbnail": True,
         "mic": True,
         "speaker": True,
         "ledStatus": True,
@@ -1150,7 +1173,10 @@ def run(host, port, device_info, token=None):
             "uptime": (now_ms - _PROCESS_START_MS) // 1000,
             "features": {
                 "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
-                "motionDetect": ["stable"],
+                "motionDetect": ["enhanced"],
+                "privacyMask": True,
+                "privacyMasks": {"maxZones": 16, "rectangleOnly": False},
+                "squareEventThumbnail": True,
                 "mic": True,
                 "speaker": True,
                 "ledStatus": True,

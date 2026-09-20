@@ -148,7 +148,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "board": {"hwaddr": mac_colons},
             "features": {
                 "smartDetect": ["person", "vehicle", "animal", "lineCrossing", "liveviewTracking"],
-                "motionDetect": ["stable"],
+                "motionDetect": ["enhanced"],
+                "privacyMask": True,
+                "privacyMasks": {"maxZones": 16, "rectangleOnly": False},
+                "squareEventThumbnail": True,
                 "mic": True,
                 "speaker": True,
                 "ledStatus": True,
